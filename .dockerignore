@@ -1,0 +1,9 @@
+models/
+qdrant_data/
+app/data/
+*.tar
+*.tar.gz
+*.zip
+.git/
+__pycache__/
+*.pyc

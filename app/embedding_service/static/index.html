@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Embedding service · Scopus AI</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%233b6fd8' d='M12 2 3 7v10l9 5 9-5V7z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z"/></svg>
+      <div>
+        <h1>Embedding service</h1>
+        <p>Build the Scopus AI search index from MySQL data</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <ul class="services" id="services" aria-label="Service status"></ul>
+      <a class="btn btn-ghost" id="scopus-link" href="#" target="_blank" rel="noopener">Open Scopus search ↗</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="card index-card" aria-labelledby="index-title">
+      <div class="index-head">
+        <h2 id="index-title">Current index</h2>
+        <span class="muted" id="index-version"></span>
+      </div>
+      <div class="index-stats" id="index-stats">
+        <span class="muted">Loading…</span>
+      </div>
+      <details class="sources" id="index-sources" hidden>
+        <summary>Sources</summary>
+        <table class="table"><tbody id="index-sources-body"></tbody></table>
+      </details>
+    </section>
+
+    <div class="grid">
+      <section class="card" aria-labelledby="folder-title">
+        <h2 id="folder-title"><span class="step">1</span>Select data folder</h2>
+        <p class="hint">Open the folder that contains the MySQL table files (<code>.frm</code>, <code>.MYD</code>, <code>.MYI</code>) or <code>.ris</code> exports.</p>
+
+        <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+
+        <div class="folder-toolbar">
+          <button class="btn btn-small" id="up-btn" type="button" disabled>↑ Up</button>
+          <button class="btn btn-small" id="refresh-btn" type="button">Refresh</button>
+          <span class="spacer"></span>
+          <button class="btn btn-small" id="upload-btn" type="button" title="Copy a folder from this computer into the import folder">Upload folder from this PC…</button>
+          <input type="file" id="upload-input" webkitdirectory directory multiple hidden>
+        </div>
+
+        <div class="upload-progress" id="upload-progress" hidden>
+          <div class="row"><span id="upload-label">Uploading…</span><span id="upload-pct">0%</span></div>
+          <div class="bar"><div class="bar-fill" id="upload-bar"></div></div>
+        </div>
+
+        <ul class="folders" id="folders" aria-label="Sub-folders"></ul>
+      </section>
+
+      <section class="card" aria-labelledby="ingest-title">
+        <h2 id="ingest-title"><span class="step">2</span>Ingest</h2>
+        <div class="selected">
+          <span class="muted">Folder</span>
+          <strong id="selected-folder">–</strong>
+        </div>
+
+        <div id="importables"></div>
+
+        <fieldset class="modes">
+          <legend>Mode</legend>
+          <label class="mode">
+            <input type="radio" name="mode" value="replace" checked>
+            <span><strong>Replace index</strong><small>Build a fresh index from this folder. Search keeps using the current index until the new one is ready.</small></span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="mode" value="append">
+            <span><strong>Add to index</strong><small>Add papers whose DOI is not indexed yet.</small></span>
+          </label>
+        </fieldset>
+
+        <button class="btn btn-primary btn-block" id="ingest-btn" type="button" disabled>Start ingest</button>
+        <p class="hint center" id="ingest-hint"></p>
+      </section>
+    </div>
+
+    <section class="card" aria-labelledby="status-title">
+      <div class="status-head">
+        <h2 id="status-title"><span class="step">3</span>Status</h2>
+        <span class="pill" id="job-pill" hidden></span>
+        <span class="spacer"></span>
+        <button class="btn btn-small btn-danger" id="cancel-btn" type="button" hidden>Cancel</button>
+      </div>
+
+      <div class="banner" id="banner" role="status" hidden></div>
+
+      <div id="job-empty" class="muted">No ingest has run yet. Select a folder and press <strong>Start ingest</strong>.</div>
+
+      <div id="job-view" hidden>
+        <div class="progress-line">
+          <span id="job-stage" aria-live="polite"></span>
+          <span class="muted" id="job-times"></span>
+          <strong id="job-percent">0%</strong>
+        </div>
+        <div class="bar bar-lg" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="job-bar-wrap">
+          <div class="bar-fill" id="job-bar"></div>
+        </div>
+
+        <ol class="stages" id="stages"></ol>
+
+        <dl class="counters" id="counters"></dl>
+
+        <details class="log" id="log-box">
+          <summary>Log <span class="muted" id="log-count"></span></summary>
+          <pre id="log"></pre>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+# Everything runs inside WSL/Docker: keep LF line endings even on a Windows checkout.
+* text=auto eol=lf
+
+*.png binary
+*.gguf binary
+*.safetensors binary

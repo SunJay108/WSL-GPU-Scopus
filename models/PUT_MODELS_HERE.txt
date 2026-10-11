@@ -1,0 +1,8 @@
+Required layout:
+
+models/
+  multilingual-e5-small/
+  bge-reranker-base/
+  qwen2.5-3b-instruct-q4_k_m.gguf
+
+The application is designed to run with local files only at runtime.

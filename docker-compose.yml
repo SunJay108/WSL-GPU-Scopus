@@ -1,0 +1,116 @@
+# Services
+#   qdrant            vector database (shared index)
+#   mariadb           reads the MySQL MyISAM files during an ingest (internal only)
+#   scopus-embedding  embedding service: pick a data folder, build the index   http://localhost:7861
+#   scopus-ai         Scopus search UI using the index                         http://localhost:7860
+
+x-runtime-env: &runtime-env
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-300}
+  QDRANT_COLLECTION: papers
+  EMBED_MODEL_PATH: /app/models/multilingual-e5-small
+  BASE_DATA_DIR: /app/app/data
+  EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
+  # Fully offline: never try to reach Hugging Face or Gradio servers.
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  GRADIO_ANALYTICS_ENABLED: "False"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: scopus-qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    # RocksDB keeps many files open; the default soft limit (1024) makes Qdrant
+    # panic with "Too many open files" while an ingest builds a second collection.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant_data:/qdrant/storage
+
+  mariadb:
+    image: mariadb:10.11.19
+    container_name: scopus-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-scopus-staging}
+    volumes:
+      # Shared with scopus-embedding, which copies table files into it.
+      - mariadb_data:/var/lib/mysql
+
+  scopus-embedding:
+    image: scopus-ai-gpu:1.1
+    container_name: scopus-embedding
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+      - mariadb
+    command: ["python", "-m", "embedding_service"]
+    ports:
+      # Admin UI: localhost only by default. Set EMBED_SERVICE_BIND=0.0.0.0
+      # in .env to allow other PCs on the network.
+      - "${EMBED_SERVICE_BIND:-127.0.0.1}:7861:7861"
+    gpus: all
+    environment:
+      <<: *runtime-env
+      IMPORT_ROOT: /import
+      IMPORT_HOST_DIR: ${IMPORT_DIR:-./app/data}
+      MARIADB_HOST: mariadb
+      MARIADB_PASSWORD: ${MARIADB_ROOT_PASSWORD:-scopus-staging}
+      MARIADB_DATADIR: /mariadb_data
+      EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-128}
+      EMBED_FP16: ${EMBED_FP16:-true}
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models:ro
+      # Folder tree the UI can browse (and upload into).
+      - ${IMPORT_DIR:-./app/data}:/import
+      - mariadb_data:/mariadb_data
+      - /etc/localtime:/etc/localtime:ro   # show local times instead of UTC
+
+  scopus-ai:
+    image: scopus-ai-gpu:1.1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scopus-ai-gpu
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      - "7860:7860"
+    gpus: all
+    environment:
+      <<: *runtime-env
+      RERANKER_PATH: /app/models/bge-reranker-base
+      LLM_PATH: /app/models/qwen2.5-3b-instruct-q4_k_m.gguf
+
+      RERANK_DEVICE: ${RERANK_DEVICE:-cuda}
+
+      LLM_CTX: ${LLM_CTX:-4096}
+      LLM_BATCH: ${LLM_BATCH:-256}
+      LLM_THREADS: ${LLM_THREADS:-4}
+      LLM_GPU_LAYERS: ${LLM_GPU_LAYERS:--1}
+      LLM_MAX_NEW_TOKENS: ${LLM_MAX_NEW_TOKENS:-512}
+      LLM_MAX_CONTINUATIONS: ${LLM_MAX_CONTINUATIONS:-6}
+
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.10}
+      LLM_REPEAT_PENALTY: ${LLM_REPEAT_PENALTY:-1.18}
+      LLM_TOP_P: ${LLM_TOP_P:-0.90}
+      LLM_TOP_K: ${LLM_TOP_K:-40}
+
+    volumes:
+      # IMPORTANT: bind-mount the whole app directory so Python/UI changes
+      # take effect without rebuilding the 20+ GB GPU image.
+      - ./app:/app/app
+      - ./models:/app/models:ro
+      - /etc/localtime:/etc/localtime:ro
+
+volumes:
+  mariadb_data:
