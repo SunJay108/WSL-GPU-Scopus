@@ -49,9 +49,8 @@ class IndexNotReady(RuntimeError):
 
 NO_INDEX_MESSAGE = (
     "⚠️ No search index is available yet.\n\n"
-    "Open the **Embedding service** (port 7861), select the folder with the "
-    "MySQL data and press **Start ingest**. This page uses the new index "
-    "automatically when the ingest has finished."
+    "Please ask an administrator to build the index. This page uses it "
+    "automatically as soon as it is ready."
 )
 
 LOW_RELEVANCE_NOTE = (
@@ -265,7 +264,7 @@ def describe_index() -> str:
         )
     if os.path.exists(BM25_PATH):
         return "🗂️ Index: built by the previous ingest script."
-    return "⚠️ No index yet. Use the Embedding service (port 7861) to ingest your MySQL data."
+    return "⚠️ No index yet. Please ask an administrator to build the index."
 
 
 def build_reranker(top_n: int):

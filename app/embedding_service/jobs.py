@@ -18,6 +18,7 @@ import time
 import traceback
 from collections import deque
 
+import audit
 from config import EMBED_JOB_DIR
 from index_meta import atomic_write_json
 
@@ -340,6 +341,14 @@ class JobManager:
                     current["state"] = "done" if status == "completed" else "failed"
                     current["finished_at"] = job.finished_at
         self.persist()
+
+        try:
+            audit.log(f"ingest_{status}", req.get("started_by"), detail={
+                "service": "embedding", "job": job.id, "folder": req.get("label"), "mode": req.get("mode"),
+                "summary": job.summary, "error": job.error,
+            })
+        except Exception as exc:  # the activity log must never break the job runner
+            print(f"⚠️ Could not write activity log: {exc}")
 
     def persist(self, throttle=False):
         now = time.time()

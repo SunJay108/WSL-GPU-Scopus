@@ -15,6 +15,10 @@ x-runtime-env: &runtime-env
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
   GRADIO_ANALYTICS_ENABLED: "False"
+  # Accounts, shared by both UIs (the first account becomes the administrator;
+  # only administrators can use the embedding service)
+  ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
+  SESSION_DAYS: ${SESSION_DAYS:-7}
 
 services:
   qdrant:

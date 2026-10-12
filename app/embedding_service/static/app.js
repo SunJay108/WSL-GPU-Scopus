@@ -62,7 +62,11 @@
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail || detail; } catch (_) { /* not JSON */ }
-      throw new Error(detail);
+      // Session expired or rights removed while the page was open.
+      if (!url.startsWith("/api/auth/") && (res.status === 401 || res.status === 403)) boot();
+      const err = new Error(detail);
+      err.status = res.status;
+      throw err;
     }
     return res.json();
   }
@@ -321,6 +325,7 @@
       state.status = status;
       render(status);
     } catch (err) {
+      if (err.status === 401 || err.status === 403) return;  // signed out: boot() takes over
       renderServices(null);
     }
     const running = state.jobState === "running";
@@ -328,7 +333,6 @@
   }
 
   function render(status) {
-    $("scopus-link").href = `${location.protocol}//${location.hostname}:${status.config.scopus_ui_port}/`;
     renderServices(status.services);
     renderIndex(status.index);
     renderJob(status.job);
@@ -490,8 +494,7 @@
       const s = job.summary;
       banner.append(
         `✅ Embedding finished: ${fmtNum(s.papers_added)} papers added (${fmtNum(s.papers_total)} in the index, ` +
-        `${fmtNum(s.chunks_total)} chunks) in ${fmtDuration(s.seconds)}. `,
-        el("a", { href: $("scopus-link").href, target: "_blank", rel: "noopener" }, "Open Scopus search ↗"));
+        `${fmtNum(s.chunks_total)} chunks) in ${fmtDuration(s.seconds)}. The search UI now uses the new index.`);
     } else if (job.state === "failed") {
       banner.append(`❌ Ingest failed: ${errorText(job)}. The previous index is still in use.`);
     } else if (job.state === "cancelled") {
@@ -540,8 +543,100 @@
     poll(true);
   });
 
-  // ?path=mysql opens that folder directly (bookmarkable); otherwise the last one used.
-  const linked = new URLSearchParams(location.search).get("path");
-  openFolder(linked !== null ? linked : storageGet("embedding.path") || "");
-  poll(true);
+  // ---------------------------------------------------------------- sign in
+
+  let authMode = "login";
+  let authState = {};
+  let started = false;
+
+  function showScreen(name) {
+    for (const id of ["auth", "denied", "app"]) $(id).hidden = id !== name;
+  }
+
+  function setAuthMode(mode) {
+    authMode = mode;
+    const signup = mode === "signup";
+    $("tab-login").setAttribute("aria-selected", String(!signup));
+    $("tab-signup").setAttribute("aria-selected", String(signup));
+    $("auth-confirm-wrap").hidden = !signup;
+    $("auth-confirm").required = signup;
+    $("auth-password").autocomplete = signup ? "new-password" : "current-password";
+    $("auth-submit").textContent = signup ? "Create account" : "Sign in";
+    $("auth-hint").textContent = signup
+      ? "Username: 3–32 letters, digits, dots, dashes or underscores. Password: at least 8 characters."
+      : "Only administrator accounts can use the embedding service.";
+    $("auth-error").hidden = true;
+  }
+
+  function showAuth(st) {
+    authState = st || authState;
+    clearTimeout(pollTimer);
+    started = false;
+    showScreen("auth");
+    $("auth-first").hidden = !authState.first_user;
+    $("tab-signup").hidden = !authState.allow_signup;
+    setAuthMode(authState.first_user ? "signup" : "login");
+    $("auth-username").focus();
+  }
+
+  async function submitAuth(e) {
+    e.preventDefault();
+    const signup = authMode === "signup";
+    const showError = (text) => { $("auth-error").textContent = text; $("auth-error").hidden = false; };
+    if (signup && $("auth-password").value !== $("auth-confirm").value) return showError("The passwords do not match.");
+    $("auth-submit").disabled = true;
+    try {
+      await api("POST", signup ? "/api/auth/signup" : "/api/auth/login", {
+        username: $("auth-username").value.trim(),
+        password: $("auth-password").value,
+      });
+      $("auth-password").value = "";
+      $("auth-confirm").value = "";
+      await boot();
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      $("auth-submit").disabled = false;
+    }
+  }
+
+  async function logout() {
+    try { await api("POST", "/api/auth/logout"); } catch (_) { /* already signed out */ }
+    location.reload();
+  }
+
+  /** Decide which screen to show from the current session. */
+  async function boot() {
+    let st;
+    try {
+      st = await api("GET", "/api/auth/state");
+    } catch (err) {
+      document.body.textContent = `Embedding service unreachable: ${err.message}`;
+      return;
+    }
+    if (!st.user) return showAuth(st);
+    if (st.user.role !== "admin") {
+      clearTimeout(pollTimer);
+      started = false;
+      $("denied-user").textContent = st.user.username;
+      return showScreen("denied");
+    }
+    showScreen("app");
+    $("me-name").textContent = st.user.username;
+    $("me-avatar").textContent = st.user.username.slice(0, 1).toUpperCase();
+    if (started) return;
+    started = true;
+    // ?path=mysql opens that folder directly (bookmarkable); otherwise the last one used.
+    const linked = new URLSearchParams(location.search).get("path");
+    openFolder(linked !== null ? linked : storageGet("embedding.path") || "");
+    poll();
+  }
+
+  $("auth-form").addEventListener("submit", submitAuth);
+  $("tab-login").addEventListener("click", () => setAuthMode("login"));
+  $("tab-signup").addEventListener("click", () => setAuthMode("signup"));
+  $("logout-btn").addEventListener("click", logout);
+  $("denied-logout").addEventListener("click", logout);
+
+  boot();
 })();

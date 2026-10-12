@@ -287,10 +287,21 @@ http://localhost:7861     Embedding service (build / update the index)
 
 No Internet connection is required.
 
+The search page asks you to sign in. On the first start, choose **Create account**: the
+first account becomes the **administrator**. Other people then create their own accounts
+(or the administrator adds them in the admin panel when `ALLOW_SIGNUP=false` in `.env`).
+
 The search page works like a chat: earlier chats are listed on the left (search, rename,
-delete, export as Markdown) and you can ask follow-up questions in the same chat. The history
-is stored in `~/Scopus/app/data/history/chat_history.sqlite3`, so it is included in WSL
-exports and backups (section 26).
+delete, export as Markdown) and you can ask follow-up questions in the same chat. Each user
+sees only their own chats.
+
+Administrators also see **Admin panel** in the sidebar (http://localhost:7860/admin): all
+user activity (logins, questions, renamed and deleted chats, …), every chat including those
+users deleted, and user management (add, disable, reset password, change role).
+
+Accounts, chats and the activity log are stored in
+`~/Scopus/app/data/history/chat_history.sqlite3`, so they are included in WSL exports and
+backups (section 26).
 
 Keep the Ubuntu window open while you use Scopus: WSL stops the distro (and with it
 all containers) shortly after the last Ubuntu window is closed. The containers start
@@ -466,6 +477,10 @@ Open:
 ```text
 http://localhost:7861
 ```
+
+Sign in with an **administrator** account (same accounts as the search page; it has its own
+login, so sign in here even if you are already signed in to the search page). Normal users
+cannot use the embedding service.
 
 1. **Select data folder** – click the folder that contains the MySQL table files
    (`.frm`, `.MYD`, `.MYI`), e.g. `mysql`. Folders with data show a badge such as `3 tables`.
@@ -779,6 +794,14 @@ Then:
 docker logs --tail 100 scopus-ai-gpu
 ```
 
+If the administrator password is forgotten:
+
+```bash
+cd ~/Scopus
+docker exec -it scopus-ai-gpu python users.py list
+docker exec -it scopus-ai-gpu python users.py reset-password <name>
+```
+
 If the embedding service is unavailable or an ingest fails:
 
 ```bash
@@ -883,7 +906,7 @@ Windows browser:
 
 ```text
 http://localhost:7860     search
-http://localhost:7861     embedding service (only when adding data)
+http://localhost:7861     embedding service (administrators, only when adding data)
 ```
 
 When finished:

@@ -40,7 +40,10 @@ It runs as two web services that share one search index:
 │   ├── query.py                hybrid retrieval + generation; reloads the index after an ingest
 │   ├── guard.py                decides which questions are answered (Scopus-AI-style)
 │   ├── filters.py              keyword lists used by the guard
-│   ├── history.py              chat history (SQLite in app/data/history)
+│   ├── history.py              chat history (own chats; deleted chats kept for admins)
+│   ├── auth.py / audit.py      accounts + sessions / activity log for the admin panel
+│   ├── db.py                   SQLite file in app/data/history
+│   ├── users.py                command-line account tool (password reset)
 │   ├── config.py               settings (env variables)
 │   ├── index_meta.py           shared description of the live index
 │   ├── ingest.py               command-line ingest (same pipeline as the UI)
@@ -131,7 +134,9 @@ For a fully offline PC, export the whole WSL distro – see `Deploy-GPU-Project-
 
 ## 6. Build the index (embedding service)
 
-1. Open **http://localhost:7861**.
+1. Open **http://localhost:7861** and sign in with an **administrator** account (the same accounts
+   as the search UI; on a fresh install, *Create account* makes the first administrator). Normal
+   users cannot use the embedding service.
 2. **Select data folder** – click through the folders (e.g. `mysql`). Folders containing data show a
    badge such as `3 tables`. The right panel lists the tables found, with sizes; untick tables you
    do not want.
@@ -169,13 +174,43 @@ Command-line alternative (same pipeline):
 Open **http://localhost:7860** – a chat interface similar to ChatGPT:
 
 - **History sidebar**: every chat is saved. *New chat*, search, rename (✎), delete (🗑),
-  *Clear all history*. History is stored on the server in `app/data/history/chat_history.sqlite3`,
+  *Delete all my chats*. History is stored on the server in `app/data/history/chat_history.sqlite3`,
   so it survives browser resets and is part of backups / the WSL export.
 - **Follow-up questions** in the same chat ("What barriers did they report?") are rewritten into a
   standalone search question using the conversation; the UI shows what was searched.
 - **Answers** stream in while they are written: summary, detailed answer with clickable citations
   `[n]`, reference cards (journal, year, DOI link, relevance) and three suggested follow-up questions.
 - **Export** a chat as Markdown (⤓ in the top bar); **copy** a single answer.
+
+### Accounts and admin panel
+
+- **Sign in / create account** on http://localhost:7860 or http://localhost:7861 – both use the same
+  accounts. The **first account created becomes the administrator**; later accounts are normal users.
+  With `ALLOW_SIGNUP=false` in `.env` only administrators can add users. Passwords are stored as
+  salted scrypt hashes; a login lasts `SESSION_DAYS` (default 7). Each UI has its own login session:
+  signing in (or out) of one does not affect the other.
+- The **embedding service is for administrators only**; a normal user who signs in there is told to
+  ask for the admin role. Uploads and ingests (started / finished / failed / cancelled) appear in the
+  admin panel's activity log.
+- Users see and manage **only their own chats** (rename, delete, delete all). Deleting hides a chat
+  from its owner; it is kept for administrators.
+- **Admin panel** – http://localhost:7860/admin (link in the sidebar for administrators):
+  - *Activity*: every action – sign-ups, logins and failed logins, questions (with the guard decision
+    and answer status), renamed / deleted / exported chats, password changes, admin actions – filterable
+    by user, action and text.
+  - *Chats*: all chats of all users, including deleted ones, readable in full.
+  - *Users*: add users, disable / enable accounts (signs them out), make admin / user, reset passwords.
+- The activity log cannot be edited or deleted from the UI.
+
+Forgotten administrator password (no Internet needed):
+
+```bash
+docker exec -it scopus-ai-gpu python users.py list
+docker exec -it scopus-ai-gpu python users.py reset-password <name>
+docker exec -it scopus-ai-gpu python users.py create-admin <name>
+```
+
+Accounts, chats and the activity log are stored in `app/data/history/chat_history.sqlite3`.
 
 ### Which questions are answered
 
@@ -292,7 +327,8 @@ Everything needed at runtime (models, tokenizer data, UI assets, fonts) is local
    alias layout (the old `papers` collection is replaced).
 4. The ingest uses the same chunking and text layout as before (title and keywords weighted, 512-token
    chunks), so retrieval quality is unchanged.
-5. The embedding UI has no login. It binds to `127.0.0.1` by default; only open it to the network
+5. Both UIs require a login (same accounts; the embedding UI only for administrators). The two UIs
+   do not link to each other. The embedding UI binds to `127.0.0.1` by default; only open it to the network
    (`EMBED_SERVICE_BIND=0.0.0.0`) on a trusted network.
 
 ## 14. Typical commands

@@ -165,7 +165,13 @@ GUARD_MODE = os.getenv("GUARD_MODE", "llm").strip().lower()
 HISTORY_TURNS = _clamp(_env_int("HISTORY_TURNS", 3), 0, 10)
 SUGGEST_FOLLOWUPS = os.getenv("SUGGEST_FOLLOWUPS", "true").strip().lower() in ("1", "true", "yes", "on")
 HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", f"{BASE_DATA_DIR}/history/chat_history.sqlite3")
-EMBED_UI_PORT = _clamp(_env_int("EMBED_UI_PORT", 7861), 1, 65535)
+
+# Accounts (shared by the search UI and the embedding service): anyone who can
+# open a page may create an account when ALLOW_SIGNUP is true (the first
+# account always can, and becomes admin); otherwise only administrators add
+# users.  Only administrators can use the embedding service.
+ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "true").strip().lower() in ("1", "true", "yes", "on")
+SESSION_DAYS = _clamp(_env_int("SESSION_DAYS", 7), 1, 365)
 
 
 # =====================================================
@@ -177,7 +183,6 @@ IMPORT_ROOT = os.getenv("IMPORT_ROOT", "/import")
 # Host path of IMPORT_ROOT, shown in the UI so users recognise the folder.
 IMPORT_HOST_DIR = os.getenv("IMPORT_HOST_DIR", IMPORT_ROOT)
 EMBED_SERVICE_PORT = _clamp(_env_int("EMBED_SERVICE_PORT", 7861), 1, 65535)
-SCOPUS_UI_PORT = _clamp(_env_int("SCOPUS_UI_PORT", 7860), 1, 65535)
 EMBED_JOB_DIR = os.getenv("EMBED_JOB_DIR", f"{BASE_DATA_DIR}/embedding_jobs")
 
 # Chunks per GPU batch.  Halved automatically on CUDA out-of-memory.

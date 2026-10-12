@@ -1,7 +1,9 @@
 """
 Embedding service: web UI + REST API for building the Scopus AI search index.
+Uses the same accounts as the search UI; only administrators can use it.
 
-    GET  /                       UI
+    GET  /                       UI (shows the sign-in screen when needed)
+    GET  /api/auth/...           sign up / sign in / sign out (web_auth.py)
     GET  /api/folders?path=      browse IMPORT_ROOT and preview importable files
     POST /api/uploads            create an upload folder (browser folder upload)
     PUT  /api/uploads/{id}/{fn}  stream one file into it
@@ -16,20 +18,22 @@ import subprocess
 import threading
 import time
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import audit
+import db
 from config import (
     EMBED_DEVICE,
     IMPORT_HOST_DIR,
     IMPORT_ROOT,
     QDRANT_COLLECTION,
     QDRANT_URL,
-    SCOPUS_UI_PORT,
 )
 from index_meta import read_index_meta
+from web_auth import WebAuth, client_ip
 
 from .errors import IngestError
 from .jobs import JobBusyError, JobManager
@@ -43,6 +47,12 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 app = FastAPI(title="Scopus AI – Embedding service", docs_url="/api/docs", redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+db.init()
+# Own session cookie: signing in here does not sign in to the search UI.
+web_auth = WebAuth(cookie="embed_session", service="embedding")
+web_auth.install(app)
+admin_user = web_auth.admin_user
 
 jobs = JobManager()
 
@@ -194,7 +204,7 @@ def index_page():
 
 
 @app.get("/api/folders")
-def list_folder(path: str = ""):
+def list_folder(path: str = "", admin: dict = Depends(admin_user)):
     target = resolve_import_path(path)
     rel = to_rel(target)
 
@@ -235,7 +245,7 @@ class IngestRequest(BaseModel):
 
 
 @app.post("/api/ingest", status_code=202)
-def start_ingest(body: IngestRequest):
+def start_ingest(body: IngestRequest, request: Request, admin: dict = Depends(admin_user)):
     if body.mode not in ("replace", "append"):
         raise HTTPException(400, "mode must be 'replace' or 'append'.")
 
@@ -249,16 +259,24 @@ def start_ingest(body: IngestRequest):
             "tables": body.tables,
             "include_ris": body.include_ris,
             "mode": body.mode,
+            "started_by": {"id": admin["id"], "username": admin["username"]},
         })
     except JobBusyError as exc:
         raise HTTPException(409, str(exc))
+    audit.log("ingest_start", admin, detail={
+        "service": "embedding", "job": job.id, "folder": display_path(rel), "mode": body.mode,
+        "tables": body.tables, "include_ris": body.include_ris,
+    }, ip=client_ip(request))
     return {"job_id": job.id}
 
 
 @app.post("/api/cancel")
-def cancel_ingest():
+def cancel_ingest(request: Request, admin: dict = Depends(admin_user)):
+    snapshot = jobs.snapshot() or {}
     if not jobs.cancel():
         raise HTTPException(409, "No ingest job is running.")
+    audit.log("ingest_cancel", admin, detail={"service": "embedding", "job": snapshot.get("id")},
+              ip=client_ip(request))
     return {"ok": True}
 
 
@@ -266,7 +284,7 @@ _last_job_state = {"value": None}
 
 
 @app.get("/api/status")
-def status(log_since: int = 0):
+def status(log_since: int = 0, admin: dict = Depends(admin_user)):
     job = jobs.snapshot(log_since)
 
     # Refresh index info right after a job finishes.
@@ -281,7 +299,6 @@ def status(log_since: int = 0):
         "services": _cached("services", 10, _services),
         "config": {
             "import_root": IMPORT_HOST_DIR,
-            "scopus_ui_port": SCOPUS_UI_PORT,
             "collection_alias": QDRANT_COLLECTION,
         },
     }
@@ -292,7 +309,7 @@ class UploadRequest(BaseModel):
 
 
 @app.post("/api/uploads")
-def create_upload(body: UploadRequest):
+def create_upload(body: UploadRequest, request: Request, admin: dict = Depends(admin_user)):
     safe = _SAFE_NAME.sub("_", body.name).strip("._")[:60] or "folder"
     upload_id = f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}"
     target = os.path.join(_root(), UPLOADS_DIR, upload_id)
@@ -302,11 +319,13 @@ def create_upload(body: UploadRequest):
         raise HTTPException(409, "Upload folder already exists; try again in a second.")
     except OSError as exc:
         raise HTTPException(500, f"Cannot create upload folder (is the import folder writable?): {exc}")
+    audit.log("upload_folder", admin, detail={"service": "embedding", "folder": display_path(to_rel(target))},
+              ip=client_ip(request))
     return {"id": upload_id, "path": to_rel(target)}
 
 
 @app.put("/api/uploads/{upload_id}/{filename}")
-async def upload_file(upload_id: str, filename: str, request: Request):
+async def upload_file(upload_id: str, filename: str, request: Request, admin: dict = Depends(admin_user)):
     if not re.fullmatch(r"[A-Za-z0-9._-]+", upload_id) or upload_id.startswith("."):
         raise HTTPException(400, "Invalid upload id.")
     if (os.path.basename(filename) != filename or filename.startswith(".")
