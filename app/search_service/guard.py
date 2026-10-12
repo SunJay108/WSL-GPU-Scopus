@@ -4,7 +4,8 @@ Question guard: decides whether a question may be answered.
 Like research assistants such as Scopus AI, it judges what a question is
 about rather than which words it contains:
 
-1. Keywords in filters.HARD_BLOCK_KEYWORDS are always refused.
+1. Keywords in filters.HARD_BLOCK_KEYWORDS, and asking what a religious group
+   thinks or believes, are always refused.
 2. The local language model classifies the question:
      RESEARCH    answered
      RESTRICTED  politics, war/military, religion, ideology, conspiracy
@@ -96,7 +97,8 @@ TOPIC_QUESTIONS = {
                 "relations between countries, rather than science, medicine, engineering or technology?",
     "military": "Is this question about war, military conflicts, the armed forces or weapons, "
                 "rather than science, medicine or engineering?",
-    "religion": "Is this question about religion, religious beliefs or practices, or religious figures?",
+    "religion": "Is this question about religion, religious beliefs or practices, what a religious group "
+                "thinks or believes, or religious figures?",
     "ideology": "Is this question about an ideological or political controversy such as abortion, "
                 "immigration, gender politics or race relations, rather than medical or scientific research?",
     "conspiracy": "Is this question about a conspiracy theory or propaganda?",
@@ -136,7 +138,7 @@ def _grammar():
     return _GRAMMAR
 
 
-def _yes_no_grammar():
+def yes_no_grammar():
     global _YES_NO
     if _YES_NO is None:
         from llama_cpp import LlamaGrammar
@@ -150,7 +152,7 @@ def is_about_topic(question, topic, chat) -> bool:
         {"role": "system", "content": "Answer YES or NO."},
         {"role": "user", "content": f"{TOPIC_QUESTIONS[topic]}\nQuestion: {question}"},
     ]
-    return chat(messages, max_tokens=2, grammar=_yes_no_grammar()).strip().upper() == "YES"
+    return chat(messages, max_tokens=2, grammar=yes_no_grammar()).strip().upper() == "YES"
 
 
 def classify(question, chat):
@@ -167,8 +169,10 @@ def classify(question, chat):
 
 def check_question(question, chat=None, standalone=None):
     """
-    Decide whether to answer.  `standalone` is the follow-up question rewritten
-    with its conversation context; it is what the model judges.
+    Decide whether to answer.  `standalone` is a follow-up rewritten with its
+    conversation context (followup.py); the model classifies it, and the topic
+    check also judges the message as typed, so a rewrite cannot turn a
+    restricted follow-up ("what do Muslims think about them?") into research.
     """
     texts = [question] + ([standalone] if standalone and standalone != question else [])
 
@@ -177,17 +181,17 @@ def check_question(question, chat=None, standalone=None):
         if keyword:
             return _blocked("RESTRICTED", f"keyword {keyword!r}")
 
-    topic_keywords = []
-    for text in texts:
-        topic_keywords += [kw for kw in find_topic_keywords(text) if kw not in topic_keywords]
+    keywords_of = {text: find_topic_keywords(text) for text in texts}
+    topic_keywords = list(dict.fromkeys(kw for kws in keywords_of.values() for kw in kws))
 
     if GUARD_MODE == "llm" and chat is not None:
         try:
             category = classify(texts[-1], chat)
-            if category == "RESEARCH" and topic_keywords:
-                for topic in dict.fromkeys(TOPIC_OF_KEYWORD[kw] for kw in topic_keywords):
-                    if is_about_topic(texts[-1], topic, chat):
-                        return _blocked("RESTRICTED", f"model ({topic})")
+            if category == "RESEARCH":
+                for text, keywords in keywords_of.items():
+                    for topic in dict.fromkeys(TOPIC_OF_KEYWORD[kw] for kw in keywords):
+                        if is_about_topic(text, topic, chat):
+                            return _blocked("RESTRICTED", f"model ({topic})")
         except Exception as exc:
             print(f"⚠️ Guard model failed ({exc}); falling back to keyword rules.")
         else:

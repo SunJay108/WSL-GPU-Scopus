@@ -91,6 +91,15 @@ TOPIC_KEYWORD_GROUPS = {
 TOPIC_KEYWORDS = [kw for group in TOPIC_KEYWORD_GROUPS.values() for kw in group]
 TOPIC_OF_KEYWORD = {kw: topic for topic, group in TOPIC_KEYWORD_GROUPS.items() for kw in group}
 
+# Asking what a religious group thinks ("what do Muslims think about it?",
+# "do Christians and Jews see it differently?") is always blocked, like
+# HARD_BLOCK_KEYWORDS: short follow-ups like these are too vague for the model.
+RELIGIOUS_GROUPS = [
+    "muslim", "christian", "jew", "jewish", "hindu", "buddhist", "catholic", "protestant",
+    "sikh", "atheist", "religious people", "believer",
+]
+OPINION_VERBS = ["think", "believe", "say", "feel", "view", "see", "teach", "consider"]
+
 
 # =====================================================
 # 2. Matching
@@ -136,12 +145,20 @@ def _keyword_pattern(keyword: str):
 
 _HARD_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in HARD_BLOCK_KEYWORDS]
 _TOPIC_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in TOPIC_KEYWORDS]
+# A group word, up to three more words ("christians and jews"), then an opinion verb.
+_GROUP_OPINION = re.compile(
+    r"\b(?:" + "|".join(RELIGIOUS_GROUPS) + r")s?\b(?:\s+\w+){0,3}?"
+    r"\s+(?:" + "|".join(OPINION_VERBS) + r")(?:s|es)?\b"
+)
 
 
 def find_hard_keyword(text: str):
-    """Return the first always-blocked keyword found in `text`, or None."""
+    """Return the first always-blocked keyword (or phrase type) found in `text`, or None."""
     normalized = _normalize(text)
-    return next((kw for kw, pattern in _HARD_PATTERNS if pattern.search(normalized)), None)
+    keyword = next((kw for kw, pattern in _HARD_PATTERNS if pattern.search(normalized)), None)
+    if keyword is None and _GROUP_OPINION.search(normalized):
+        keyword = "opinion of a religious group"
+    return keyword
 
 
 def find_topic_keywords(text: str):

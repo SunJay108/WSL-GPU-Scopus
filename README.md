@@ -45,6 +45,7 @@ It runs as two web services that share one search index:
 │   ├── search_service/         Scopus search UI (port 7860)
 │   │   ├── server.py           REST API: chat, history, admin panel
 │   │   ├── query.py            hybrid retrieval + generation; reloads the index after an ingest
+│   │   ├── followup.py         turns follow-up questions into standalone search questions
 │   │   ├── guard.py            decides which questions are answered (Scopus-AI-style)
 │   │   ├── filters.py          keyword lists used by the guard
 │   │   ├── history.py          chat history (own chats; deleted chats kept for admins)
@@ -185,7 +186,10 @@ Open **http://localhost:7860** – a chat interface similar to ChatGPT:
   *Delete all my chats*. History is stored on the server in `app/data/history/chat_history.sqlite3`,
   so it survives browser resets and is part of backups / the WSL export.
 - **Follow-up questions** in the same chat ("What barriers did they report?") are rewritten into a
-  standalone search question using the conversation; the UI shows what was searched.
+  standalone search question using the conversation; the UI shows what was searched. Only real
+  follow-ups are rewritten (`app/search_service/followup.py`): a message that names its own subject
+  ("what is graphene", "tell me about Tokyo") is searched and checked exactly as in a new chat, so an
+  earlier topic never takes over a new question.
 - **Answers** stream in while they are written: summary, detailed answer with clickable citations
   `[n]`, reference cards (journal, year, DOI link, relevance) and three suggested follow-up questions.
 - **Export** a chat as Markdown (⤓ in the top bar); **copy** a single answer.
@@ -227,9 +231,9 @@ words:
 
 | Step | What happens |
 |---|---|
-| 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/search_service/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). |
+| 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/search_service/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). Asking what a religious group thinks ("what do Muslims think about it?") is refused too. |
 | 2. Language model | The local model classifies the question: research → answered; restricted topic (politics, war/military, religion, ideology, conspiracy), personal information about a person, harmful requests, off-topic chat → a short explanation instead. |
-| 3. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. |
+| 3. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. For a follow-up, both the message as typed and the rewritten question are checked. |
 | 4. Relevance | If the best paper scores below `RELEVANCE_MIN_SCORE` the answer is "no relevant papers" instead of an answer from unrelated sources; below `RELEVANCE_WARN_SCORE` the answer carries a "loosely related papers" notice. |
 
 `docker logs scopus-ai-gpu` shows each decision, e.g. `Guard: RESTRICTED (keyword 'xi jinping')`.

@@ -443,7 +443,7 @@ No rebuild. The code is organised as:
 ```text
 app/core/                shared by both services (settings, accounts, activity log)
 app/search_service/      search page: query.py, guard.py (what is answered),
-                         filters.py (keyword lists), history.py, server.py
+                         filters.py (keyword lists), followup.py, history.py, server.py
 app/embedding_service/   embedding service
 ```
 

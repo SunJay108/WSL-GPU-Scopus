@@ -27,6 +27,7 @@ from qdrant_client import QdrantClient
 
 from core.config import *
 from .filters import find_hard_keyword
+from .followup import standalone_question
 from .guard import check_question
 from core.index_meta import index_signature, read_index_meta
 
@@ -619,7 +620,7 @@ def add_sentence_level_citations(answer_text: str, nodes, references) -> str:
 
 
 # =====================================================
-# Summary, follow-ups, conversation context
+# Summary and follow-up suggestions
 # =====================================================
 
 def generate_summary(full_answer: str) -> str:
@@ -665,40 +666,6 @@ Concise summary:
     # Deterministic fallback: only complete sentences.
     sents = split_into_sentences(full_answer, min_length=10)
     return " ".join(sents[:3])
-
-
-def standalone_question(question: str, history) -> str:
-    """
-    Rewrite a follow-up ("what about its accuracy?") into a self-contained
-    search question using the previous turns.  history: [{"question", "answer"}].
-    """
-    turns = [t for t in (history or []) if t.get("question")][-HISTORY_TURNS:]
-    if not turns:
-        return question
-
-    context = "\n".join(
-        f"User: {t['question']}\nAssistant: {(t.get('answer') or '')[:600]}" for t in turns
-    )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Rewrite the user's latest message as one standalone research question for a "
-                "scientific literature search, using the conversation only to resolve references "
-                "such as 'it', 'they' or 'this method'. If the message is already standalone, "
-                "repeat it unchanged. Output only the question."
-            ),
-        },
-        {"role": "user", "content": f"Conversation:\n{context}\n\nLatest message: {question}"},
-    ]
-    try:
-        rewritten = chat(messages, max_tokens=80).strip().strip('"').strip()
-    except Exception as exc:
-        print(f"Follow-up rewrite failed: {exc}")
-        return question
-    if not rewritten or len(rewritten) > 400 or "\n" in rewritten:
-        return question
-    return rewritten
 
 
 def suggest_followups(question: str, summary: str):
@@ -799,7 +766,7 @@ def _answer(question, history, emit):
         get_llm(), get_embed_model(), get_reranker()
 
     stage("check", "Checking the question…")
-    standalone = standalone_question(question, history) if history else question
+    standalone = standalone_question(question, history, chat)
     decision = check_question(question, chat=chat, standalone=standalone)
     print(f"Guard: {decision.category} ({decision.reason}): {question!r}"
           + (f" -> {standalone!r}" if standalone != question else ""))
