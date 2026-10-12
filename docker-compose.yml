@@ -105,6 +105,12 @@ services:
       LLM_TOP_P: ${LLM_TOP_P:-0.90}
       LLM_TOP_K: ${LLM_TOP_K:-40}
 
+      # Question guard and answer quality (see app/guard.py, app/config.py)
+      GUARD_MODE: ${GUARD_MODE:-llm}
+      RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
+      RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}
+      SUGGEST_FOLLOWUPS: ${SUGGEST_FOLLOWUPS:-true}
+
     volumes:
       # IMPORTANT: bind-mount the whole app directory so Python/UI changes
       # take effect without rebuilding the 20+ GB GPU image.

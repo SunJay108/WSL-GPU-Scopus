@@ -287,6 +287,11 @@ http://localhost:7861     Embedding service (build / update the index)
 
 No Internet connection is required.
 
+The search page works like a chat: earlier chats are listed on the left (search, rename,
+delete, export as Markdown) and you can ask follow-up questions in the same chat. The history
+is stored in `~/Scopus/app/data/history/chat_history.sqlite3`, so it is included in WSL
+exports and backups (section 26).
+
 Keep the Ubuntu window open while you use Scopus: WSL stops the distro (and with it
 all containers) shortly after the last Ubuntu window is closed. The containers start
 again automatically the next time you open `wsl -d ScopusAI`.
@@ -427,10 +432,14 @@ Same for:
 ```text
 config.py
 query.py
-filters.py
+guard.py       question guard (what is answered)
+filters.py     keyword lists used by the guard
+history.py
 main.py
 index_meta.py
 ```
+
+Files in `app/web/` (the chat page) need no restart: reload the browser page.
 
 Workflow:
 

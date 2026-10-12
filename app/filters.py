@@ -105,49 +105,96 @@
 
 
 import re
+import unicodedata
 
 # =====================================================
-# 1. HARD BLOCKLIST (politics, war, religion, ideology)
+# 1. BLOCKLISTS (politics, war, religion, ideology)
 # =====================================================
+#
+# Two tiers (see guard.py for the full decision flow):
+#
+# HARD_BLOCK_KEYWORDS  always blocked, no model needed: names and phrases that
+#                      practically never occur in a research question.
+# TOPIC_KEYWORDS       restricted-topic words that also have common research
+#                      meanings ("support vector machine", "heart attack",
+#                      "nuclear magnetic resonance", "air pollution in China").
+#                      A match makes the language model decide whether the
+#                      question is really about a restricted topic.  Without the
+#                      model (GUARD_MODE=keywords) these block as well.
 
-BANNED_KEYWORDS = [
+HARD_BLOCK_KEYWORDS = [
 
-    # ---- Politics / government / elections ----
-    "president", "prime minister", "election", "vote", "voting", "ballot", "government",
-    "parliament", "congress", "senate", "democrat", "republican", "communist", "socialist",
-    "capitalism", "liberal", "conservative", "dictator", "regime", "policy", "sanction",
-    "campaign", "referendum", "geopolitics", "diplomacy",
-
-    # ---- Countries & leaders (modern) ----
+    # ---- Political leaders ----
     "trump", "biden", "putin", "xi jinping", "zelensky", "netanyahu",
-    "russia", "ukraine", "china", "taiwan", "israel", "palestine", "iran", "iraq",
-    "north korea", "south korea", "nato", "eu", "european union", "united nations", "un",
 
-    # ---- War / conflict / weapons ----
-    "war", "battle", "military", "army", "navy", "air force", "missile", "nuclear",
-    "weapon", "bomb", "drone strike", "invasion", "genocide", "terrorist", "terrorism",
-    "extremist", "isis", "al qaeda", "taliban", "hamas", "hezbollah",
+    # ---- Politics ----
+    "president", "prime minister", "parliament", "senate", "democrat", "republican",
+    "communist", "socialist", "ballot", "referendum", "geopolitics",
 
-    # ---- Religion ----
-    "god", "allah", "jesus", "bible", "quran", "islam", "christian", "christianity",
-    "muslim", "judaism", "jewish", "buddhism", "hinduism", "church", "mosque", "temple",
-    "prayer", "prophet", "faith", "religion", "religious",
+    # ---- Extremist groups / terror ----
+    "isis", "al qaeda", "taliban", "hamas", "hezbollah",
+    "genocide", "terrorist", "terrorism", "assassinate", "drone strike",
 
-    # ---- Ideology / social conflict ----
-    "gender", "lgbt", "lgbtq", "transgender", "feminism", "racism", "racial", "sexism",
-    "abortion", "immigration", "migrant", "refugee", "woke", "identity politics",
+    # ---- Religious figures / scripture ----
+    "allah", "jesus", "bible", "quran",
 
-    # ---- Conspiracy / propaganda ----
-    "conspiracy", "hoax", "plandemic", "deep state", "false flag", "propaganda",
-    "mind control", "cover up",
+    # ---- Conspiracy / ideology slogans ----
+    "plandemic", "deep state", "false flag", "woke", "identity politics",
 
-    # ---- Persuasion / activism ----
-    "should we", "why we should", "convince", "persuade", "support", "oppose",
-    "is it good or bad", "who is right",
-
-    # ---- Violence / crime ----
-    "kill", "murder", "assassinate", "attack", "shooting", "bombing"
+    # ---- Persuasion ----
+    "why we should", "is it good or bad", "who is right",
 ]
+
+TOPIC_KEYWORD_GROUPS = {
+
+    "politics": [
+        # Politics / government / elections
+        "election", "vote", "voting", "government", "congress", "capitalism", "liberal",
+        "conservative", "dictator", "regime", "policy", "sanction", "campaign", "diplomacy",
+        "politic",
+        # Countries & organisations
+        "russia", "ukraine", "china", "taiwan", "israel", "palestine", "iran", "iraq",
+        "iranian", "iraqi",
+        "north korea", "south korea", "nato", "eu", "european union", "united nations", "un",
+    ],
+
+    "military": [
+        "war", "warfare", "battle", "military", "army", "navy", "air force", "missile", "nuclear",
+        "weapon", "bomb", "invasion", "extremist", "soldier", "troop",
+    ],
+
+    "religion": [
+        "god", "islam", "christian", "christianity", "muslim", "judaism", "jewish", "buddhism",
+        "hinduism", "church", "mosque", "temple", "prayer", "prophet", "faith", "religion",
+        "religious",
+        # followers and beliefs
+        "hindu", "buddhist", "catholic", "protestant", "sikh", "jew", "atheist", "atheism",
+        "theology", "pope", "afterlife", "karma", "reincarnation",
+    ],
+
+    "ideology": [
+        "gender", "lgbt", "lgbtq", "transgender", "feminism", "racism", "racial", "sexism",
+        "abortion", "immigration", "migrant", "refugee",
+    ],
+
+    "conspiracy": [
+        "conspiracy", "hoax", "propaganda", "mind control", "cover up",
+    ],
+
+    "persuasion": [
+        "should we", "convince", "persuade", "support", "oppose",
+    ],
+
+    "violence": [
+        "kill", "murder", "attack", "shooting", "bombing",
+    ],
+}
+
+TOPIC_KEYWORDS = [kw for group in TOPIC_KEYWORD_GROUPS.values() for kw in group]
+TOPIC_OF_KEYWORD = {kw: topic for topic, group in TOPIC_KEYWORD_GROUPS.items() for kw in group}
+
+# Every keyword of both tiers (used by the keyword-only mode and output checks).
+BANNED_KEYWORDS = HARD_BLOCK_KEYWORDS + TOPIC_KEYWORDS
 
 # =====================================================
 # 2. ACADEMIC QUERY PATTERNS (high precision intent)
@@ -199,12 +246,76 @@ ACADEMIC_PATTERNS = [
 # 3. Public API
 # =====================================================
 
+def _normalize(text: str) -> str:
+    """Lower-case, fold full-width characters, and turn punctuation/underscores into spaces."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    return re.sub(r"[\W_]+", " ", text).strip()
+
+
+def _keyword_pattern(keyword: str):
+    """
+    Compile one banned keyword into a word-aware pattern.
+
+    - Words of a phrase may be joined by a space, hyphen or nothing, so
+      "xi jinping" also matches "xijinping" and "Xi-Jinping".
+    - Matching always starts at a word boundary, so "eu" no longer matches
+      "neural" and "war" no longer matches "software".
+    - A short last word (<= 4 letters) must be a whole word, optionally
+      inflected ("war" -> "wars", "kill" -> "killed"), so "kill" does not hit
+      "skills" and "isis" does not hit "crisis".
+    - A longer last word also matches derived forms ("russia" -> "russian",
+      "election" -> "elections", "islam" -> "islamic").
+    - Keywords in non-Latin scripts match anywhere in the text.
+    """
+    words = _normalize(keyword).split()
+    stems = [re.escape(w) for w in words]
+    if not "".join(words).isascii():
+        # Scripts such as Chinese have no English-style word breaks:
+        # match these keywords anywhere.
+        return re.compile(r"\s*".join(stems))
+    last = words[-1]
+    if last.endswith("y"):
+        stems[-1] = re.escape(last[:-1]) + "(?:y|ie)"  # policy -> policies, army -> armies
+
+    if len(last) <= 4:
+        tail = r"(?:s|es|ed|ing|ings|er|ers)?\b"
+    else:
+        tail = r"\w*"
+    return re.compile(r"\b" + r"\s*".join(stems) + tail)
+
+
+_HARD_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in HARD_BLOCK_KEYWORDS]
+_TOPIC_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in TOPIC_KEYWORDS]
+_BANNED_PATTERNS = _HARD_PATTERNS + _TOPIC_PATTERNS
+
+
+def find_banned_keyword(text: str, patterns=None):
+    """Return the first banned keyword (either tier) found in `text`, or None."""
+    normalized = _normalize(text)
+    for keyword, pattern in patterns or _BANNED_PATTERNS:
+        if pattern.search(normalized):
+            return keyword
+    return None
+
+
+def find_hard_keyword(text: str):
+    """Return the first always-blocked keyword found in `text`, or None."""
+    return find_banned_keyword(text, _HARD_PATTERNS)
+
+
+def find_topic_keyword(text: str):
+    """Return the first restricted-topic keyword found in `text`, or None."""
+    return find_banned_keyword(text, _TOPIC_PATTERNS)
+
+
+def find_topic_keywords(text: str):
+    """All restricted-topic keywords found in `text`."""
+    normalized = _normalize(text)
+    return [kw for kw, pattern in _TOPIC_PATTERNS if pattern.search(normalized)]
+
+
 def is_blocked_query(text: str) -> bool:
-    t = text.lower()
-    for word in BANNED_KEYWORDS:
-        if word in t:
-            return True
-    return False
+    return find_banned_keyword(text) is not None
 
 
 def is_academic_query(text: str) -> bool:
@@ -232,11 +343,8 @@ def is_academic_query(text: str) -> bool:
 
 
 def contains_banned_content(text: str, banned_keywords: list) -> bool:
-    text_lower = text.lower()
-
-    for kw in banned_keywords:
-        # whole word match or substring
-        if re.search(rf"\b{re.escape(kw.lower())}\b", text_lower):
-            return True
-
-    return False
+    if banned_keywords is BANNED_KEYWORDS:
+        patterns = _BANNED_PATTERNS
+    else:
+        patterns = [(kw, _keyword_pattern(kw)) for kw in banned_keywords]
+    return find_banned_keyword(text, patterns) is not None

@@ -2,6 +2,7 @@ import os
 import pickle
 import re
 import threading
+import time
 
 import numpy as np
 # torch must be imported before llama_cpp (via LlamaCPP below): llama.cpp links
@@ -18,7 +19,8 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from config import *
-from filters import BANNED_KEYWORDS, contains_banned_content, is_academic_query, is_blocked_query
+from filters import BANNED_KEYWORDS, contains_banned_content, find_hard_keyword
+from guard import check_question
 from index_meta import index_signature, read_index_meta
 
 
@@ -37,6 +39,8 @@ _bm25_corpus = None
 _index_signature = None
 
 _load_lock = threading.RLock()
+# One llama.cpp model instance: answer one question at a time.
+_answer_lock = threading.Lock()
 
 
 class IndexNotReady(RuntimeError):
@@ -48,6 +52,17 @@ NO_INDEX_MESSAGE = (
     "Open the **Embedding service** (port 7861), select the folder with the "
     "MySQL data and press **Start ingest**. This page uses the new index "
     "automatically when the ingest has finished."
+)
+
+LOW_RELEVANCE_NOTE = (
+    "⚠️ Only loosely related papers were found in the database, so this answer may not "
+    "address your question directly."
+)
+
+NO_RESULTS_MESSAGE = (
+    "🔍 No sufficiently relevant papers were found in the database for this question.\n\n"
+    "This system only answers from the indexed literature. Try other keywords, a more "
+    "specific research question, or check that the topic is covered by the indexed data."
 )
 
 
@@ -165,6 +180,18 @@ def get_llm():
         return _llm
 
 
+def chat(messages, max_tokens=64, grammar=None, temperature=0.0) -> str:
+    """Short chat-formatted completion (uses the model's own chat template)."""
+    model = get_llm()._model
+    out = model.create_chat_completion(
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        grammar=grammar,
+    )
+    return (out["choices"][0]["message"].get("content") or "").strip()
+
+
 def get_reranker():
     global _reranker
 
@@ -205,8 +232,26 @@ def get_retriever():
         return _retriever
 
 
+def models_loaded() -> bool:
+    return _llm is not None and _reranker is not None and _embed_model is not None
+
+
+def index_info() -> dict:
+    """Description of the live index for the UI."""
+    meta = read_index_meta()
+    if meta:
+        return {
+            "ready": True,
+            "papers": meta.get("papers"),
+            "chunks": meta.get("chunks"),
+            "built_at": meta.get("built_at"),
+            "sources": [s.get("name") for s in meta.get("sources") or []],
+        }
+    return {"ready": os.path.exists(BM25_PATH), "legacy": os.path.exists(BM25_PATH)}
+
+
 def describe_index() -> str:
-    """One-line Markdown status of the index for the UI header."""
+    """One-line Markdown status of the index."""
     meta = read_index_meta()
     if meta:
         sources = meta.get("sources") or []
@@ -253,8 +298,7 @@ def hybrid_query(question, top_k=None):
     retriever = get_retriever()
     reranker = get_reranker()
 
-    # 1. Vector retrieval, reranked to RERANK_TOP_N.  (This used to run a full
-    #    query engine, which also generated an LLM answer that was discarded.)
+    # 1. Vector retrieval, reranked to RERANK_TOP_N.
     vector_nodes = reranker.postprocess_nodes(
         retriever.retrieve(question),
         query_str=question,
@@ -289,7 +333,13 @@ def hybrid_query(question, top_k=None):
 
         if key not in fused:
             fused[key] = {
-                "node": TextNode(text=doc["text"], metadata=md),
+                "node": TextNode(
+                    text=doc["text"],
+                    metadata=md,
+                    # Same as at ingest time: "source" is not part of the text.
+                    excluded_embed_metadata_keys=["source"],
+                    excluded_llm_metadata_keys=["source"],
+                ),
                 "score": 0.0,
             }
 
@@ -306,7 +356,8 @@ def hybrid_query(question, top_k=None):
         for item in fused_list
     ]
 
-    # 4. Cross-encoder rerank (cached model; returns at most RERANK_TOP_N)
+    # 4. Cross-encoder rerank (cached model; returns at most RERANK_TOP_N,
+    #    scores 0..1)
     reranked_nodes = reranker.postprocess_nodes(
         nodes,
         query_str=question,
@@ -332,6 +383,15 @@ def _strip_model_prefixes(text: str) -> str:
 
 def _remove_end_marker(text: str) -> str:
     return text.replace(END_MARKER, "").strip()
+
+
+def _visible(text: str) -> str:
+    """Text safe to show while streaming: no END_MARKER, not even half of one."""
+    text = _strip_model_prefixes(text.replace(END_MARKER, ""))
+    for size in range(len(END_MARKER) - 1, 0, -1):
+        if text.endswith(END_MARKER[:size]):
+            return text[:-size]
+    return text
 
 
 def _trim_incomplete_tail(text: str) -> str:
@@ -380,9 +440,23 @@ def _merge_continuation(existing: str, continuation: str) -> str:
     return existing + "\n" + continuation
 
 
+def _generate(prompt: str, on_partial=None) -> str:
+    """One bounded completion; streams the growing text to on_partial if given."""
+    llm = get_llm()
+    if on_partial is None:
+        return str(llm.complete(prompt)).strip()
+
+    text = ""
+    for part in llm.stream_complete(prompt):
+        text = part.text
+        on_partial(text)
+    return text.strip()
+
+
 def complete_without_truncation(
     initial_prompt: str,
     max_continuations: int = None,
+    on_text=None,
 ) -> str:
     """
     Generate a response in bounded chunks until the model emits END_MARKER.
@@ -390,13 +464,17 @@ def complete_without_truncation(
     LLM_MAX_NEW_TOKENS therefore limits one generation call, not the final
     displayed answer.  If the model still fails to finish after the allowed
     continuation calls, an incomplete final prose fragment is removed.
+    on_text(visible_text) receives the answer while it is being generated.
     """
     if max_continuations is None:
         max_continuations = LLM_MAX_CONTINUATIONS
 
-    llm = get_llm()
+    def stream(prefix):
+        if on_text is None:
+            return None
+        return lambda partial: on_text(_visible((prefix + "\n" + partial) if prefix else partial))
 
-    first = str(llm.complete(initial_prompt)).strip()
+    first = _generate(initial_prompt, stream(""))
     combined = _strip_model_prefixes(first)
 
     if END_MARKER in combined:
@@ -422,7 +500,7 @@ Recent end of the existing answer:
 Continuation:
 """
 
-        continuation = str(llm.complete(continuation_prompt)).strip()
+        continuation = _generate(continuation_prompt, stream(combined))
 
         if not continuation:
             break
@@ -437,55 +515,32 @@ Continuation:
 
 
 # =====================================================
-# Query validation
+# Sentences and citations
 # =====================================================
 
-def safe_query(question: str) -> str:
-    question = question.strip()
-
-    if not question:
-        return "⚠️ Please enter a non-empty academic question."
-
-    if is_blocked_query(question):
-        return (
-            "⛔ This system is restricted to academic literature research only.\n\n"
-            "Political, religious, military, or ideological topics are not supported."
-        )
-
-    # Academic-intent filtering remains disabled, preserving your current
-    # behavior.  Re-enable this block if desired.
-    # if not is_academic_query(question):
-    #     return (
-    #         "⚠️ This system only supports academic research questions based "
-    #         "on the paper database."
-    #     )
-
-    try:
-        return query_with_sources(question)
-    except IndexNotReady as exc:
-        print(f"Index not ready: {exc}")
-        return NO_INDEX_MESSAGE
+# Periods that do not end a sentence ("Smith et al. (2024) showed ...").
+_ABBREVIATIONS = (
+    "et al.", "e.g.", "i.e.", "etc.", "vs.", "cf.", "approx.",
+    "Fig.", "Figs.", "Eq.", "Ref.", "No.", "Vol.", "Dr.", "Prof.",
+)
+_DOT = "․"  # placeholder for protected periods
 
 
-# =====================================================
-# Sentence helpers / citations
-# =====================================================
+def split_into_sentences(text: str, min_length: int = 0):
+    protected = text.strip()
+    for abbr in _ABBREVIATIONS:
+        protected = protected.replace(abbr, abbr.replace(".", _DOT))
+    protected = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", r"\1" + _DOT, protected)  # initials
 
-def split_into_sentences(text: str):
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [s.strip() for s in sentences if len(s.strip()) > 10]
+    sentences = re.split(r"(?<=[.!?])\s+", protected)
+    sentences = [s.replace(_DOT, ".").strip() for s in sentences]
+    return [s for s in sentences if len(s) > min_length]
 
 
 def keep_complete_sentences(text: str, max_sentences=None) -> str:
     """Return only complete prose sentences, optionally limiting count."""
-    text = _remove_end_marker(text).strip()
-
-    sentences = re.findall(
-        r"[^.!?]+[.!?](?=\s|$)",
-        text,
-        flags=re.DOTALL,
-    )
-    sentences = [re.sub(r"\s+", " ", s).strip() for s in sentences if s.strip()]
+    text = re.sub(r"\s+", " ", _remove_end_marker(text)).strip()
+    sentences = [s for s in split_into_sentences(text) if s.endswith((".", "!", "?"))]
 
     if max_sentences is not None:
         sentences = sentences[:max_sentences]
@@ -493,121 +548,88 @@ def keep_complete_sentences(text: str, max_sentences=None) -> str:
     return " ".join(sentences)
 
 
-def embed_texts(embed_model, texts):
-    return np.array([
-        embed_model.get_text_embedding(t)
-        for t in texts
-    ])
+def _paper_key(metadata: dict) -> str:
+    doi = (metadata.get("doi") or "").strip().lower()
+    return doi or "title:" + (metadata.get("title") or "").strip().lower()
 
 
-def add_sentence_level_citations(answer_text: str, response):
-    # Reuse the global embedding model.  Do not load a second copy on GPU.
+def build_references(nodes):
+    """Distinct papers of the source chunks, numbered by relevance rank."""
+    references = []
+    seen = set()
+    for item in nodes:
+        md = item.node.metadata or {}
+        key = _paper_key(md)
+        if key in seen:
+            continue
+        seen.add(key)
+        references.append({
+            "n": len(references) + 1,
+            "title": md.get("title") or "Unknown title",
+            "doi": md.get("doi") or "",
+            "year": md.get("year") or "",
+            "journal": md.get("journal") or "",
+            "source": md.get("source") or "",
+            "score": round(float(item.score or 0), 4),
+        })
+    return references
+
+
+def add_sentence_level_citations(answer_text: str, nodes, references) -> str:
+    """
+    Append [n] to sentences that are clearly supported by a source chunk;
+    n is the number of that paper in `references`.  Paragraphs and list items
+    of the answer are preserved.
+    """
+    if not nodes or not references:
+        return answer_text
+
+    number_of = {_paper_key(ref): ref["n"] for ref in references}
+
+    # Split into blocks/lines/sentences, remembering the layout.
+    blocks = []
+    for block in re.split(r"\n\s*\n", answer_text.strip()):
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        is_list = any(re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", ln) for ln in lines)
+        units = lines if is_list else [" ".join(ln.strip() for ln in lines)]
+        blocks.append((is_list, [split_into_sentences(u) for u in units]))
+
+    sentences = [s for _, units in blocks for unit in units for s in unit]
+    # Only real sentences get a citation, not headings like "Main methods include:".
+    candidates = [s for s in sentences if len(s) > 10 and s.rstrip("*_ ").endswith((".", "!", "?"))]
+    if not candidates:
+        return answer_text
+
     embed_model = get_embed_model()
-
-    sentences = split_into_sentences(answer_text)
-
-    if not sentences:
-        return answer_text, []
-
-    source_chunks = []
-    source_meta = []
-
-    for src in response.source_nodes:
-        node = src.node
-        source_chunks.append(node.text)
-        source_meta.append(node.metadata or {})
-
-    if not source_chunks:
-        return answer_text, []
-
-    sent_embeds = embed_texts(embed_model, sentences)
-    chunk_embeds = embed_texts(embed_model, source_chunks)
+    sent_embeds = np.array(embed_model.get_text_embedding_batch(candidates))
+    chunk_embeds = np.array(embed_model.get_text_embedding_batch([n.node.text for n in nodes]))
     sim = cosine_similarity(sent_embeds, chunk_embeds)
 
-    citation_map = {}
-    references = []
-    next_id = 1
-    cited_sentences = []
+    cite_for = {}
+    for i, sentence in enumerate(candidates):
+        best = int(np.argmax(sim[i]))
+        if float(sim[i][best]) > 0.3:
+            n = number_of.get(_paper_key(nodes[best].node.metadata or {}))
+            if n:
+                cite_for[sentence] = n
 
-    for i, sentence in enumerate(sentences):
-        best_idx = int(np.argmax(sim[i]))
-        best_score = float(sim[i][best_idx])
-        md = source_meta[best_idx]
+    def cite(sentence):
+        n = cite_for.get(sentence)
+        if not n:
+            return sentence
+        # Put the marker before the final punctuation: "... results [2]."
+        match = re.match(r"^(.*?)([.!?]+)$", sentence)
+        return f"{match.group(1)} [{n}]{match.group(2)}" if match else f"{sentence} [{n}]"
 
-        title = md.get("title") or md.get("dc:title") or "Unknown title"
-        doi = md.get("doi") or md.get("prism:doi") or ""
-        year = md.get("year") or md.get("prism:coverDate") or ""
-        journal = md.get("journal") or md.get("prism:publicationName") or ""
-
-        key = (title, doi)
-
-        if key not in citation_map:
-            citation_map[key] = next_id
-            references.append((next_id, title, doi, year, journal))
-            next_id += 1
-
-        cid = citation_map[key]
-
-        if best_score > 0.3:
-            cited_sentences.append(f"{sentence} [{cid}]")
-        else:
-            cited_sentences.append(sentence)
-
-    return " ".join(cited_sentences), references
+    out_blocks = []
+    for is_list, units in blocks:
+        rendered = [" ".join(cite(s) for s in unit) for unit in units]
+        out_blocks.append("\n".join(rendered) if is_list else rendered[0])
+    return "\n\n".join(out_blocks)
 
 
 # =====================================================
-# References
-# =====================================================
-
-def build_ranked_evidence_section(response):
-    nodes = response.source_nodes
-
-    if not nodes:
-        return ""
-
-    nodes = sorted(
-        nodes,
-        key=lambda x: float(x.score or 0),
-        reverse=True,
-    )
-
-    md = "\n\n---\n## 📚 References\n\n"
-    used = set()
-    rank = 1
-
-    for src in nodes:
-        node = src.node
-        meta = node.metadata or {}
-
-        title = meta.get("title") or meta.get("dc:title") or "Unknown title"
-        doi = meta.get("doi") or meta.get("prism:doi") or ""
-        year = meta.get("year") or meta.get("prism:coverDate") or ""
-        journal = meta.get("journal") or meta.get("prism:publicationName") or ""
-
-        key = (title, doi)
-        if key in used:
-            continue
-        used.add(key)
-
-        score = float(src.score or 0)
-
-        md += f"### [{rank}] {title}\n"
-        md += f"- **Relevance score:** `{score:.4f}`\n"
-        md += f"- **Year:** {year}\n"
-        md += f"- **Journal:** {journal}\n"
-
-        if doi:
-            md += f"- **DOI:** https://doi.org/{doi}\n"
-
-        md += "\n"
-        rank += 1
-
-    return md
-
-
-# =====================================================
-# Summary generation
+# Summary, follow-ups, conversation context
 # =====================================================
 
 def generate_summary(full_answer: str) -> str:
@@ -651,30 +673,83 @@ Concise summary:
         print("Summary generation error:", exc)
 
     # Deterministic fallback: only complete sentences.
-    sents = split_into_sentences(full_answer)
+    sents = split_into_sentences(full_answer, min_length=10)
     return " ".join(sents[:3])
+
+
+def standalone_question(question: str, history) -> str:
+    """
+    Rewrite a follow-up ("what about its accuracy?") into a self-contained
+    search question using the previous turns.  history: [{"question", "answer"}].
+    """
+    turns = [t for t in (history or []) if t.get("question")][-HISTORY_TURNS:]
+    if not turns:
+        return question
+
+    context = "\n".join(
+        f"User: {t['question']}\nAssistant: {(t.get('answer') or '')[:600]}" for t in turns
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite the user's latest message as one standalone research question for a "
+                "scientific literature search, using the conversation only to resolve references "
+                "such as 'it', 'they' or 'this method'. If the message is already standalone, "
+                "repeat it unchanged. Output only the question."
+            ),
+        },
+        {"role": "user", "content": f"Conversation:\n{context}\n\nLatest message: {question}"},
+    ]
+    try:
+        rewritten = chat(messages, max_tokens=80).strip().strip('"').strip()
+    except Exception as exc:
+        print(f"Follow-up rewrite failed: {exc}")
+        return question
+    if not rewritten or len(rewritten) > 400 or "\n" in rewritten:
+        return question
+    return rewritten
+
+
+def suggest_followups(question: str, summary: str):
+    """Up to three follow-up research questions the user can click."""
+    messages = [
+        {
+            "role": "system",
+            "content": "You suggest follow-up questions for researchers using a scientific literature search engine.",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\nAnswer summary: {summary}\n\n"
+                "Suggest three short, specific follow-up research questions (at most 15 words "
+                "each) that research papers could answer. One per line, no numbering."
+            ),
+        },
+    ]
+    try:
+        text = chat(messages, max_tokens=120, temperature=0.2)
+    except Exception as exc:
+        print(f"Follow-up suggestions failed: {exc}")
+        return []
+
+    suggestions = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip().strip('"')
+        if len(line) < 10 or len(line) > 160 or find_hard_keyword(line):
+            continue
+        if not line.endswith("?"):
+            line += "?"
+        if line.lower() != question.lower() and line not in suggestions:
+            suggestions.append(line)
+    return suggestions[:3]
 
 
 # =====================================================
 # Main RAG response
 # =====================================================
 
-def query_with_sources(question: str) -> str:
-    reranked_nodes = hybrid_query(
-        question,
-        top_k=HYBRID_TOP_K,
-    )
-
-    if not reranked_nodes:
-        return "⚠️ No relevant academic papers found."
-
-    # Keep the original design: use the top reranked chunks as grounded context.
-    context = "\n\n".join([
-        n.node.text
-        for n in reranked_nodes[:4]
-    ])
-
-    prompt = f"""
+ANSWER_PROMPT = """
 You are an academic research assistant.
 
 Answer the following question using ONLY the provided sources.
@@ -687,7 +762,7 @@ Rules:
 - Be concise but sufficiently detailed to answer the question.
 - If the available sources do not support a requested point, say so.
 - Never stop in the middle of a sentence.
-- When the entire answer is complete, append {END_MARKER}.
+- When the entire answer is complete, append {end_marker}.
 
 Question:
 {question}
@@ -698,40 +773,150 @@ Sources:
 Answer:
 """
 
-    answer_text = complete_without_truncation(prompt)
 
-    class FakeResponse:
-        def __init__(self, nodes, response_text):
-            self.source_nodes = nodes
-            self.response = response_text
+def answer_question(question: str, history=None, progress=None) -> dict:
+    """
+    Answer one question (optionally a follow-up in a conversation).
 
-    response = FakeResponse(reranked_nodes, answer_text)
+    progress(event, **data) receives "stage" events (stage, text) and "delta"
+    events (text = the answer written so far).  Returns a dict with
+    status = answered | blocked | no_results | no_index | empty.
+    """
+    emit = progress or (lambda event, **data: None)
+    question = (question or "").strip()
+    if not question:
+        return _final({"status": "empty", "message": "⚠️ Please enter a non-empty academic question."})
 
-    if not response.source_nodes:
-        return (
-            "⚠️ No relevant academic papers were found in the database.\n"
-            "This system does not answer questions without literature support."
-        )
+    if not _answer_lock.acquire(blocking=False):
+        emit("stage", stage="queued", text="Waiting for the previous question to finish…")
+        _answer_lock.acquire()
+    try:
+        return _answer(question, history, emit)
+    finally:
+        _answer_lock.release()
 
-    summary = generate_summary(answer_text)
-    cited_answer, references = add_sentence_level_citations(
-        answer_text,
-        response,
+
+def _answer(question, history, emit):
+    timings = {}
+    started = time.time()
+
+    def stage(name, text):
+        timings[name] = time.time()
+        emit("stage", stage=name, text=text)
+
+    if not models_loaded():
+        stage("loading", "Loading models (first question only)…")
+        get_llm(), get_embed_model(), get_reranker()
+
+    stage("check", "Checking the question…")
+    standalone = standalone_question(question, history) if history else question
+    decision = check_question(question, chat=chat, standalone=standalone)
+    print(f"Guard: {decision.category} ({decision.reason}): {question!r}"
+          + (f" -> {standalone!r}" if standalone != question else ""))
+    base = {
+        "question": question,
+        "standalone_question": standalone if standalone != question else None,
+        "guard": {"category": decision.category, "reason": decision.reason},
+    }
+    if not decision.allowed:
+        return _final({**base, "status": "blocked", "message": decision.message})
+
+    papers = (read_index_meta() or {}).get("papers")
+    stage("search", f"Searching {papers:,} papers…" if papers else "Searching papers…")
+    try:
+        nodes = hybrid_query(standalone, top_k=HYBRID_TOP_K)
+    except IndexNotReady as exc:
+        print(f"Index not ready: {exc}")
+        return _final({**base, "status": "no_index", "message": NO_INDEX_MESSAGE})
+
+    top_score = max((float(n.score or 0) for n in nodes), default=0.0)
+    base["top_score"] = round(top_score, 4)
+    if top_score < RELEVANCE_MIN_SCORE:
+        print(f"No relevant papers (best score {top_score:.3f} < {RELEVANCE_MIN_SCORE})")
+        return _final({**base, "status": "no_results", "message": NO_RESULTS_MESSAGE})
+    if top_score < RELEVANCE_WARN_SCORE:
+        base["notice"] = LOW_RELEVANCE_NOTE
+
+    nodes = [n for n in nodes if float(n.score or 0) >= SOURCE_MIN_SCORE] or nodes[:1]
+    context = "\n\n".join(n.node.text for n in nodes[:4])
+
+    stage("answer", "Writing the answer…")
+    last_emit = [0.0]
+
+    def on_text(text):
+        now = time.time()
+        if now - last_emit[0] >= 0.15:
+            last_emit[0] = now
+            emit("delta", text=text)
+
+    answer_text = complete_without_truncation(
+        ANSWER_PROMPT.format(end_marker=END_MARKER, question=standalone, context=context),
+        on_text=on_text,
     )
-    ranked_section = build_ranked_evidence_section(response)
+    emit("delta", text=answer_text)
 
-    final = ""
-    final += "## ✅ Summary Answer\n\n"
-    final += summary + "\n\n"
-    final += "---\n## 🧠 Detailed Answer (with citations)\n\n"
-    final += cited_answer + "\n\n"
-    final += ranked_section
+    stage("summary", "Summarizing…")
+    summary = generate_summary(answer_text)
+
+    stage("cite", "Adding citations…")
+    references = build_references(nodes)
+    cited_answer = add_sentence_level_citations(answer_text, nodes, references)
+
+    followups = []
+    if SUGGEST_FOLLOWUPS:
+        stage("followups", "Suggesting follow-up questions…")
+        followups = suggest_followups(standalone, summary)
 
     # Optional final safety filter preserved from your original code.
-    # if contains_banned_content(final, BANNED_KEYWORDS):
-    #     return (
-    #         "⛔ The generated answer contains restricted content.\n\n"
-    #         "Please reformulate your question."
-    #     )
+    # if contains_banned_content(cited_answer, BANNED_KEYWORDS):
+    #     return _final({**base, "status": "blocked",
+    #                    "message": "⛔ The generated answer contains restricted content."})
 
-    return final
+    return _final({
+        **base,
+        "status": "answered",
+        "summary": summary,
+        "answer": cited_answer,
+        "references": references,
+        "followups": followups,
+        "seconds": round(time.time() - started, 1),
+    })
+
+
+def format_markdown(result: dict) -> str:
+    """Markdown rendering of an answer (export, CLI, safe_query)."""
+    if result.get("status") != "answered":
+        return result.get("message", "")
+
+    md = ""
+    if result.get("standalone_question"):
+        md += f"*Searched for: {result['standalone_question']}*\n\n"
+    if result.get("notice"):
+        md += f"> {result['notice']}\n\n"
+    md += "## ✅ Summary Answer\n\n" + result["summary"] + "\n\n"
+    md += "---\n## 🧠 Detailed Answer (with citations)\n\n" + result["answer"] + "\n\n"
+
+    if result.get("references"):
+        md += "---\n## 📚 References\n\n"
+        for ref in result["references"]:
+            md += f"### [{ref['n']}] {ref['title']}\n"
+            md += f"- **Relevance score:** `{ref['score']:.4f}`\n"
+            md += f"- **Year:** {ref['year']}\n"
+            md += f"- **Journal:** {ref['journal']}\n"
+            if ref["doi"]:
+                md += f"- **DOI:** https://doi.org/{ref['doi']}\n"
+            md += "\n"
+
+    if result.get("followups"):
+        md += "---\n## 🔎 Related questions\n\n" + "".join(f"- {q}\n" for q in result["followups"])
+    return md
+
+
+def _final(result: dict) -> dict:
+    result["markdown"] = format_markdown(result)
+    return result
+
+
+def safe_query(question: str) -> str:
+    """Single question -> Markdown answer (kept for scripts and tests)."""
+    return answer_question(question)["markdown"]

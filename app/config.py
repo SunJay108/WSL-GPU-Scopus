@@ -142,6 +142,31 @@ HYBRID_TOP_K = _clamp(_env_int("HYBRID_TOP_K", 10), 4, 30)
 RERANK_TOP_N = _clamp(_env_int("RERANK_TOP_N", 5), 1, 20)
 HNSW_EF = _clamp(_env_int("HNSW_EF", 512), 32, 2048)
 
+# Reranker scores are 0..1 (measured: questions the index covers score
+# 0.5-1.0, topics with only related papers ~0.15, unrelated questions <0.07).
+# Best paper below RELEVANCE_MIN_SCORE: declined ("no relevant papers") instead
+# of answering from unrelated sources.  Below RELEVANCE_WARN_SCORE: answered
+# with a notice that only loosely related papers were found.  Papers below
+# SOURCE_MIN_SCORE are left out of the answer context and the references.
+RELEVANCE_MIN_SCORE = _clamp(_env_float("RELEVANCE_MIN_SCORE", 0.1), 0.0, 1.0)
+RELEVANCE_WARN_SCORE = _clamp(_env_float("RELEVANCE_WARN_SCORE", 0.3), 0.0, 1.0)
+SOURCE_MIN_SCORE = _clamp(_env_float("SOURCE_MIN_SCORE", 0.05), 0.0, 1.0)
+
+
+# =====================================================
+# Question guard / chat
+# =====================================================
+
+# "llm": the language model judges whether a question is research (see
+# guard.py); "keywords": every keyword in filters.py blocks (old behaviour).
+GUARD_MODE = os.getenv("GUARD_MODE", "llm").strip().lower()
+
+# Previous question/answer pairs used to understand follow-up questions.
+HISTORY_TURNS = _clamp(_env_int("HISTORY_TURNS", 3), 0, 10)
+SUGGEST_FOLLOWUPS = os.getenv("SUGGEST_FOLLOWUPS", "true").strip().lower() in ("1", "true", "yes", "on")
+HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", f"{BASE_DATA_DIR}/history/chat_history.sqlite3")
+EMBED_UI_PORT = _clamp(_env_int("EMBED_UI_PORT", 7861), 1, 65535)
+
 
 # =====================================================
 # Embedding service (ingestion UI)

@@ -8,7 +8,7 @@ It runs as two web services that share one search index:
 | Service | URL | Purpose |
 |---|---|---|
 | **Embedding service** (`scopus-embedding`) | http://localhost:7861 | Select the folder with the MySQL data, press **Start ingest**, watch progress, get an alert when it is done |
-| **Scopus search UI** (`scopus-ai`) | http://localhost:7860 | Ask questions; answers are grounded in the indexed papers |
+| **Scopus search UI** (`scopus-ai`) | http://localhost:7860 | Chat with history: ask research questions and follow-ups; answers cite the indexed papers |
 
 ```text
  MySQL data folder (.frm/.MYD/.MYI)                                  Browser
@@ -16,7 +16,7 @@ It runs as two web services that share one search index:
             ▼                                                   :7861│      │:7860
  ┌────────────────────┐  stage + SQL  ┌─────────┐        ┌───────────▼──┐ ┌─▼──────────┐
  │ scopus-embedding   │──────────────▶│ mariadb │        │  embedding   │ │ scopus-ai  │
- │ (FastAPI + UI)     │◀──────────────│ (intern)│        │  UI          │ │ (Gradio)   │
+ │ (FastAPI + UI)     │◀──────────────│ (intern)│        │  UI          │ │ (chat UI)  │
  └─────────┬──────────┘     rows      └─────────┘        └──────────────┘ └─────┬──────┘
            │ vectors (new collection, then alias swap)                          │ search
            ▼                                                                    ▼
@@ -35,9 +35,12 @@ It runs as two web services that share one search index:
 ```text
 .
 ├── app/
-│   ├── main.py                 Scopus search UI (Gradio, port 7860)
+│   ├── main.py                 Scopus search UI: chat API + web UI (port 7860)
+│   ├── web/                    chat UI (no external resources; works offline)
 │   ├── query.py                hybrid retrieval + generation; reloads the index after an ingest
-│   ├── filters.py              topic filters
+│   ├── guard.py                decides which questions are answered (Scopus-AI-style)
+│   ├── filters.py              keyword lists used by the guard
+│   ├── history.py              chat history (SQLite in app/data/history)
 │   ├── config.py               settings (env variables)
 │   ├── index_meta.py           shared description of the live index
 │   ├── ingest.py               command-line ingest (same pipeline as the UI)
@@ -49,7 +52,8 @@ It runs as two web services that share one search index:
 │   │   └── static/             web UI (no external resources; works offline)
 │   └── data/
 │       ├── mysql/              example MySQL data (3 tables)
-│       └── storage/            bm25.pkl, index_meta.json (written by ingest)
+│       ├── storage/            bm25.pkl, index_meta.json (written by ingest)
+│       └── history/            chat_history.sqlite3 (search UI history)
 ├── models/
 ├── qdrant_data/
 ├── scripts/
@@ -160,7 +164,36 @@ Command-line alternative (same pipeline):
 ./scripts/ingest.sh mysql --mode append
 ```
 
-## 7. GPU settings
+## 7. Ask questions (Scopus search UI)
+
+Open **http://localhost:7860** – a chat interface similar to ChatGPT:
+
+- **History sidebar**: every chat is saved. *New chat*, search, rename (✎), delete (🗑),
+  *Clear all history*. History is stored on the server in `app/data/history/chat_history.sqlite3`,
+  so it survives browser resets and is part of backups / the WSL export.
+- **Follow-up questions** in the same chat ("What barriers did they report?") are rewritten into a
+  standalone search question using the conversation; the UI shows what was searched.
+- **Answers** stream in while they are written: summary, detailed answer with clickable citations
+  `[n]`, reference cards (journal, year, DOI link, relevance) and three suggested follow-up questions.
+- **Export** a chat as Markdown (⤓ in the top bar); **copy** a single answer.
+
+### Which questions are answered
+
+Like Scopus AI, the guard (`app/guard.py`) judges what a question is about instead of only matching
+words:
+
+| Step | What happens |
+|---|---|
+| 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). |
+| 2. Language model | The local model classifies the question: research → answered; restricted topic (politics, war/military, religion, ideology, conspiracy), personal information about a person, harmful requests, off-topic chat → a short explanation instead. |
+| 3. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. |
+| 4. Relevance | If the best paper scores below `RELEVANCE_MIN_SCORE` the answer is "no relevant papers" instead of an answer from unrelated sources; below `RELEVANCE_WARN_SCORE` the answer carries a "loosely related papers" notice. |
+
+`docker logs scopus-ai-gpu` shows each decision, e.g. `Guard: RESTRICTED (keyword 'xi jinping')`.
+Edit the lists in `app/filters.py` and restart the container to change the policy; `GUARD_MODE=keywords`
+in `.env` switches back to plain keyword blocking.
+
+## 8. GPU settings
 
 `.env`:
 
@@ -185,7 +218,7 @@ docker compose start scopus-ai
 Each ingest runs in its own worker process, so all GPU memory used for embedding is released when
 the job ends.
 
-## 8. Verify GPU acceleration
+## 9. Verify GPU acceleration
 
 ```bash
 ./scripts/verify_gpu.sh
@@ -193,7 +226,7 @@ the job ends.
 
 Expected: `llama_supports_gpu_offload = True` and `torch.cuda.is_available = True` for both services.
 
-## 9. Logs and troubleshooting
+## 10. Logs and troubleshooting
 
 ```bash
 docker compose ps
@@ -207,11 +240,12 @@ docker logs -f scopus-mariadb
 |---|---|
 | UI chip "MariaDB unreachable" right after start | MariaDB initialises its data directory on first start; wait ~20 s |
 | "No search index is available yet" in the search UI | Run an ingest in the embedding UI |
+| A research question is refused | `docker logs scopus-ai-gpu \| grep Guard:` shows why; adjust `app/filters.py`, or lower `RELEVANCE_MIN_SCORE` for "no relevant papers" |
 | Embedding shows "on cpu" | GPU not visible in the container (`./scripts/verify_gpu.sh`) or `EMBED_DEVICE=cpu` |
 | Embedding UI not reachable from another PC | Set `EMBED_SERVICE_BIND=0.0.0.0` in `.env`, then `docker compose up -d` |
 | Data folder on a Windows drive | Set `IMPORT_DIR=/mnt/d/your/folder` in `.env`, then `docker compose up -d` |
 
-## 10. Create the fully-offline bundle
+## 11. Create the fully-offline bundle
 
 After the online build has been tested:
 
@@ -237,7 +271,7 @@ offline_bundle/
 
 Copy `offline_bundle` to the offline PC (USB SSD etc.).
 
-## 11. Run on the fully-offline PC
+## 12. Run on the fully-offline PC
 
 Prerequisites: WSL2/Ubuntu 24.04, Docker Engine, NVIDIA Windows driver, NVIDIA Container Toolkit.
 
@@ -250,7 +284,7 @@ chmod +x import_offline.sh verify_gpu.sh
 Then open http://localhost:7861 to ingest data and http://localhost:7860 to search.
 Everything needed at runtime (models, tokenizer data, UI assets, fonts) is local.
 
-## 12. Notes
+## 13. Notes
 
 1. Build and validate the CUDA image online first; do not compile `llama-cpp-python` on the offline PC.
 2. Keep `qdrant_data` and `app/data/storage` together when transferring a prebuilt index.
@@ -261,7 +295,7 @@ Everything needed at runtime (models, tokenizer data, UI assets, fonts) is local
 5. The embedding UI has no login. It binds to `127.0.0.1` by default; only open it to the network
    (`EMBED_SERVICE_BIND=0.0.0.0`) on a trusted network.
 
-## 13. Typical commands
+## 14. Typical commands
 
 ```bash
 docker compose up -d                       # start
