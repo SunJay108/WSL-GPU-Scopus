@@ -9,9 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-import audit
-import auth
-from config import ALLOW_SIGNUP, SESSION_DAYS
+from . import audit, auth
+from .config import ALLOW_SIGNUP, SESSION_DAYS
 
 
 class Credentials(BaseModel):

@@ -23,17 +23,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import audit
-import db
-from config import (
+from core import audit, db
+from core.config import (
     EMBED_DEVICE,
     IMPORT_HOST_DIR,
     IMPORT_ROOT,
     QDRANT_COLLECTION,
     QDRANT_URL,
 )
-from index_meta import read_index_meta
-from web_auth import WebAuth, client_ip
+from core.index_meta import read_index_meta
+from core.web_auth import WebAuth, client_ip
 
 from .errors import IngestError
 from .jobs import JobBusyError, JobManager

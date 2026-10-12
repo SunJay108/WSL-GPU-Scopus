@@ -18,9 +18,9 @@ import time
 import traceback
 from collections import deque
 
-import audit
-from config import EMBED_JOB_DIR
-from index_meta import atomic_write_json
+from core import audit
+from core.config import EMBED_JOB_DIR
+from core.index_meta import atomic_write_json
 
 from .errors import IngestCancelled, IngestError
 from .pipeline import STAGES, ConsoleReporter, run_ingest

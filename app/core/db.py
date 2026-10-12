@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 
-from config import HISTORY_DB_PATH
+from .config import HISTORY_DB_PATH
 
 
 # Serialises writes from the web server's threads.

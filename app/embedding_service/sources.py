@@ -17,7 +17,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 
-from config import (
+from core.config import (
     MARIADB_DATADIR,
     MARIADB_HOST,
     MARIADB_PASSWORD,

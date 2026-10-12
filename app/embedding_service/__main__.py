@@ -1,6 +1,6 @@
 import uvicorn
 
-from config import EMBED_SERVICE_PORT
+from core.config import EMBED_SERVICE_PORT
 
 
 if __name__ == "__main__":

@@ -15,8 +15,8 @@ about rather than which words it contains:
    (filters.TOPIC_KEYWORDS, e.g. "attack", "policy", "China", "Muslim"), the
    model answers one narrow yes/no question for that topic as well.  Such
    words are therefore allowed in genuine research questions only.
-3. If the model is unavailable (or GUARD_MODE=keywords), every keyword in
-   filters.BANNED_KEYWORDS blocks.
+3. If the model is unavailable (or GUARD_MODE=keywords), every keyword of
+   both lists in filters.py blocks.
 
 After retrieval, query.py also declines questions for which the database
 holds no sufficiently relevant papers.
@@ -24,8 +24,8 @@ holds no sufficiently relevant papers.
 
 from dataclasses import asdict, dataclass
 
-from config import GUARD_MODE
-from filters import TOPIC_OF_KEYWORD, find_hard_keyword, find_topic_keywords
+from core.config import GUARD_MODE
+from .filters import TOPIC_OF_KEYWORD, find_hard_keyword, find_topic_keywords
 
 
 CATEGORIES = ("RESEARCH", "RESTRICTED", "PERSONAL", "HARMFUL", "OFF_TOPIC")

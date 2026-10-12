@@ -1,3 +1,10 @@
+"""
+Answering pipeline: hybrid retrieval (Qdrant vectors + BM25, RRF fusion,
+cross-encoder rerank), grounded generation with the local LLM, summary,
+citations and follow-up suggestions.  Reloads the index when the embedding
+service publishes a new one.
+"""
+
 import os
 import pickle
 import re
@@ -18,10 +25,10 @@ from llama_index.llms.llama_cpp import LlamaCPP
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
-from config import *
-from filters import BANNED_KEYWORDS, contains_banned_content, find_hard_keyword
-from guard import check_question
-from index_meta import index_signature, read_index_meta
+from core.config import *
+from .filters import find_hard_keyword
+from .guard import check_question
+from core.index_meta import index_signature, read_index_meta
 
 
 # =====================================================
@@ -249,22 +256,6 @@ def index_info() -> dict:
     return {"ready": os.path.exists(BM25_PATH), "legacy": os.path.exists(BM25_PATH)}
 
 
-def describe_index() -> str:
-    """One-line Markdown status of the index."""
-    meta = read_index_meta()
-    if meta:
-        sources = meta.get("sources") or []
-        names = ", ".join(s.get("name", "?") for s in sources[:3])
-        if len(sources) > 3:
-            names += f" +{len(sources) - 3} more"
-        return (
-            f"🗂️ Index: **{meta.get('papers', 0):,} papers** · "
-            f"{meta.get('chunks', 0):,} chunks · built {meta.get('built_at', '?')}"
-            + (f" · {names}" if names else "")
-        )
-    if os.path.exists(BM25_PATH):
-        return "🗂️ Index: built by the previous ingest script."
-    return "⚠️ No index yet. Please ask an administrator to build the index."
 
 
 def build_reranker(top_n: int):
@@ -866,11 +857,6 @@ def _answer(question, history, emit):
         stage("followups", "Suggesting follow-up questions…")
         followups = suggest_followups(standalone, summary)
 
-    # Optional final safety filter preserved from your original code.
-    # if contains_banned_content(cited_answer, BANNED_KEYWORDS):
-    #     return _final({**base, "status": "blocked",
-    #                    "message": "⛔ The generated answer contains restricted content."})
-
     return _final({
         **base,
         "status": "answered",
@@ -883,7 +869,7 @@ def _answer(question, history, emit):
 
 
 def format_markdown(result: dict) -> str:
-    """Markdown rendering of an answer (export, CLI, safe_query)."""
+    """Markdown rendering of an answer (stored with the chat, used for export and copy)."""
     if result.get("status") != "answered":
         return result.get("message", "")
 
@@ -914,8 +900,3 @@ def format_markdown(result: dict) -> str:
 def _final(result: dict) -> dict:
     result["markdown"] = format_markdown(result)
     return result
-
-
-def safe_query(question: str) -> str:
-    """Single question -> Markdown answer (kept for scripts and tests)."""
-    return answer_question(question)["markdown"]

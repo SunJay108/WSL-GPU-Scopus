@@ -27,10 +27,6 @@ offline_bundle/
 __pycache__/
 *.pyc
 
-# Local backups / stale files
-* - Copy.py
-SHA256SUMS.txt
-
 # Windows / WSL artefacts
 *Zone.Identifier
 Thumbs.db

@@ -41,4 +41,4 @@ WORKDIR /app/app
 
 EXPOSE 7860 7861
 
-CMD ["python", "main.py"]
+CMD ["python", "-m", "search_service"]

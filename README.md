@@ -35,36 +35,44 @@ It runs as two web services that share one search index:
 ```text
 .
 ├── app/
-│   ├── main.py                 Scopus search UI: chat API + web UI (port 7860)
-│   ├── web/                    chat UI (no external resources; works offline)
-│   ├── query.py                hybrid retrieval + generation; reloads the index after an ingest
-│   ├── guard.py                decides which questions are answered (Scopus-AI-style)
-│   ├── filters.py              keyword lists used by the guard
-│   ├── history.py              chat history (own chats; deleted chats kept for admins)
-│   ├── auth.py / audit.py      accounts + sessions / activity log for the admin panel
-│   ├── db.py                   SQLite file in app/data/history
-│   ├── users.py                command-line account tool (password reset)
-│   ├── config.py               settings (env variables)
-│   ├── index_meta.py           shared description of the live index
-│   ├── ingest.py               command-line ingest (same pipeline as the UI)
-│   ├── embedding_service/      embedding service (port 7861)
+│   ├── core/                   shared by both services
+│   │   ├── config.py           settings (environment variables from .env)
+│   │   ├── db.py               SQLite file in app/data/history (accounts, chats, activity log)
+│   │   ├── auth.py             accounts, password hashes, login sessions
+│   │   ├── web_auth.py         sign-up / login endpoints used by both UIs
+│   │   ├── audit.py            activity log shown in the admin panel
+│   │   └── index_meta.py       description of the live index (written by ingest, read by search)
+│   ├── search_service/         Scopus search UI (port 7860)
+│   │   ├── server.py           REST API: chat, history, admin panel
+│   │   ├── query.py            hybrid retrieval + generation; reloads the index after an ingest
+│   │   ├── guard.py            decides which questions are answered (Scopus-AI-style)
+│   │   ├── filters.py          keyword lists used by the guard
+│   │   ├── history.py          chat history (own chats; deleted chats kept for admins)
+│   │   └── static/             chat UI and admin panel (no external resources; works offline)
+│   ├── embedding_service/      embedding service (port 7861, administrators only)
 │   │   ├── server.py           REST API
 │   │   ├── jobs.py             background job + progress (one worker process per ingest)
 │   │   ├── pipeline.py         read → chunk → BM25 → embed → Qdrant → publish
 │   │   ├── sources.py          MySQL (MyISAM via MariaDB) and RIS readers
 │   │   └── static/             web UI (no external resources; works offline)
+│   ├── ingest.py               command line: ingest without the UI
+│   ├── users.py                command line: accounts (password reset)
 │   └── data/
 │       ├── mysql/              example MySQL data (3 tables)
 │       ├── storage/            bm25.pkl, index_meta.json (written by ingest)
-│       └── history/            chat_history.sqlite3 (search UI history)
+│       └── history/            chat_history.sqlite3
 ├── models/
 ├── qdrant_data/
-├── scripts/
+├── scripts/                    build, upgrade, export/import offline bundle, ingest, GPU check
 ├── .env / .env.example
-├── Dockerfile
+├── Dockerfile                  full image build
+├── Dockerfile.upgrade          quick 1.0 → 1.1 image upgrade
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+Each service runs as a Python package from `app/` (`python -m search_service`,
+`python -m embedding_service`); `docker-compose.yml` starts them.
 
 The git repository contains code and configuration only. Models, MySQL/RIS data, `qdrant_data/`
 and `app/data/storage/` are not committed (size and licensing): copy the models into `models/`,
@@ -214,18 +222,18 @@ Accounts, chats and the activity log are stored in `app/data/history/chat_histor
 
 ### Which questions are answered
 
-Like Scopus AI, the guard (`app/guard.py`) judges what a question is about instead of only matching
+Like Scopus AI, the guard (`app/search_service/guard.py`) judges what a question is about instead of only matching
 words:
 
 | Step | What happens |
 |---|---|
-| 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). |
+| 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/search_service/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). |
 | 2. Language model | The local model classifies the question: research → answered; restricted topic (politics, war/military, religion, ideology, conspiracy), personal information about a person, harmful requests, off-topic chat → a short explanation instead. |
 | 3. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. |
 | 4. Relevance | If the best paper scores below `RELEVANCE_MIN_SCORE` the answer is "no relevant papers" instead of an answer from unrelated sources; below `RELEVANCE_WARN_SCORE` the answer carries a "loosely related papers" notice. |
 
 `docker logs scopus-ai-gpu` shows each decision, e.g. `Guard: RESTRICTED (keyword 'xi jinping')`.
-Edit the lists in `app/filters.py` and restart the container to change the policy; `GUARD_MODE=keywords`
+Edit the lists in `app/search_service/filters.py` and restart the container to change the policy; `GUARD_MODE=keywords`
 in `.env` switches back to plain keyword blocking.
 
 ## 8. GPU settings
@@ -275,7 +283,7 @@ docker logs -f scopus-mariadb
 |---|---|
 | UI chip "MariaDB unreachable" right after start | MariaDB initialises its data directory on first start; wait ~20 s |
 | "No search index is available yet" in the search UI | Run an ingest in the embedding UI |
-| A research question is refused | `docker logs scopus-ai-gpu \| grep Guard:` shows why; adjust `app/filters.py`, or lower `RELEVANCE_MIN_SCORE` for "no relevant papers" |
+| A research question is refused | `docker logs scopus-ai-gpu \| grep Guard:` shows why; adjust `app/search_service/filters.py`, or lower `RELEVANCE_MIN_SCORE` for "no relevant papers" |
 | Embedding shows "on cpu" | GPU not visible in the container (`./scripts/verify_gpu.sh`) or `EMBED_DEVICE=cpu` |
 | Embedding UI not reachable from another PC | Set `EMBED_SERVICE_BIND=0.0.0.0` in `.env`, then `docker compose up -d` |
 | Data folder on a Windows drive | Set `IMPORT_DIR=/mnt/d/your/folder` in `.env`, then `docker compose up -d` |

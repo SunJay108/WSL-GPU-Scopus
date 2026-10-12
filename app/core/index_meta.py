@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 
-from config import BM25_PATH, INDEX_META_PATH
+from .config import BM25_PATH, INDEX_META_PATH
 
 
 def read_index_meta():

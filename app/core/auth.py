@@ -15,8 +15,8 @@ import secrets
 import threading
 import time
 
-from config import SESSION_DAYS
-from db import connect, write_lock
+from .config import SESSION_DAYS
+from .db import connect, write_lock
 
 
 ROLES = ("user", "admin")

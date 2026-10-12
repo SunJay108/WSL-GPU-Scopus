@@ -429,7 +429,7 @@ Therefore you can edit Python code without rebuilding Docker.
 For example:
 
 ```bash
-nano ~/Scopus/app/query.py
+nano ~/Scopus/app/search_service/query.py
 ```
 
 Then:
@@ -438,31 +438,20 @@ Then:
 docker restart scopus-ai-gpu
 ```
 
-Same for:
+No rebuild. The code is organised as:
 
 ```text
-config.py
-query.py
-guard.py       question guard (what is answered)
-filters.py     keyword lists used by the guard
-history.py
-main.py
-index_meta.py
+app/core/                shared by both services (settings, accounts, activity log)
+app/search_service/      search page: query.py, guard.py (what is answered),
+                         filters.py (keyword lists), history.py, server.py
+app/embedding_service/   embedding service
 ```
 
-Files in `app/web/` (the chat page) need no restart: reload the browser page.
+Files in `app/search_service/static/` (the chat page and admin panel) need no restart:
+reload the browser page.
 
-Workflow:
-
-```bash
-nano app/query.py
-
-docker restart scopus-ai-gpu
-```
-
-No rebuild.
-
-For the embedding service (`app/embedding_service/`, `app/ingest.py`) restart that container instead:
+After changing `app/core/` restart both containers. For the embedding service
+(`app/embedding_service/`, `app/ingest.py`) restart that container:
 
 ```bash
 docker restart scopus-embedding
@@ -510,10 +499,9 @@ cd ~/Scopus
 You normally do **not** rebuild the database when changing:
 
 ```text
-query.py
-config.py
-main.py
-filters.py
+search code (app/search_service/)
+settings (.env, app/core/config.py)
+guard keyword lists (filters.py)
 UI design
 generation settings
 summary settings
@@ -641,7 +629,7 @@ It is primarily the size of one generation segment.
 
 # 22. Configuration file
 
-Runtime settings live in `.env` (they override the defaults in `app/config.py`):
+Runtime settings live in `.env` (they override the defaults in `app/core/config.py`):
 
 ```bash
 nano ~/Scopus/.env

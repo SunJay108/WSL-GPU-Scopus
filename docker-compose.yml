@@ -11,10 +11,9 @@ x-runtime-env: &runtime-env
   EMBED_MODEL_PATH: /app/models/multilingual-e5-small
   BASE_DATA_DIR: /app/app/data
   EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
-  # Fully offline: never try to reach Hugging Face or Gradio servers.
+  # Fully offline: never try to reach Hugging Face.
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
-  GRADIO_ANALYTICS_ENABLED: "False"
   # Accounts, shared by both UIs (the first account becomes the administrator;
   # only administrators can use the embedding service)
   ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
@@ -85,6 +84,7 @@ services:
       dockerfile: Dockerfile
     container_name: scopus-ai-gpu
     restart: unless-stopped
+    command: ["python", "-m", "search_service"]
     depends_on:
       - qdrant
     ports:
@@ -109,7 +109,7 @@ services:
       LLM_TOP_P: ${LLM_TOP_P:-0.90}
       LLM_TOP_K: ${LLM_TOP_K:-40}
 
-      # Question guard and answer quality (see app/guard.py, app/config.py)
+      # Question guard and answer quality (see app/search_service/guard.py, app/core/config.py)
       GUARD_MODE: ${GUARD_MODE:-llm}
       RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
       RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}

@@ -7,7 +7,7 @@ Entries are only ever added, never changed or deleted through the UI.
 import json
 import time
 
-from db import connect, write_lock
+from .db import connect, write_lock
 
 
 ACTIONS = {

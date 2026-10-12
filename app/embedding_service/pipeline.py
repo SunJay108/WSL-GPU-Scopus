@@ -14,7 +14,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from config import (
+from core.config import (
     BM25_PATH,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -29,7 +29,7 @@ from config import (
     QDRANT_TIMEOUT,
     QDRANT_URL,
 )
-from index_meta import read_index_meta, write_index_meta
+from core.index_meta import read_index_meta, write_index_meta
 
 from .errors import IngestCancelled, IngestError
 from .sources import MariaDBStaging, iter_ris_papers, scan_folder

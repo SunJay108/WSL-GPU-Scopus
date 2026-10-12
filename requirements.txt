@@ -9,11 +9,7 @@ torch
 numpy==1.26.4
 scikit-learn==1.5.2
 rank_bm25==0.2.2
-tqdm
-regex
-ujson
 rispy
-gradio==6.4.0
 fastapi
 uvicorn
 grpcio==1.68.1

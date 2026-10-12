@@ -13,9 +13,7 @@ import getpass
 import sys
 import time
 
-import audit
-import auth
-import db
+from core import audit, auth, db
 
 
 def _ask_password():

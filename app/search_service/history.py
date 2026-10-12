@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 
-from db import connect, write_lock
+from core.db import connect, write_lock
 
 
 _COLUMNS = "c.id, c.title, c.created_at, c.updated_at, c.user_id, c.deleted_at"

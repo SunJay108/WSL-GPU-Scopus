@@ -39,24 +39,21 @@ import traceback
 from typing import Optional
 from urllib.parse import quote
 
-import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import audit
-import auth
-import db
-import history
-from query import answer_question, index_info, models_loaded
-from web_auth import WebAuth, client_ip as _ip
+from core import audit, auth, db
+from . import history
+from .query import answer_question, index_info, models_loaded
+from core.web_auth import WebAuth, client_ip as _ip
 
 
-WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 app = FastAPI(title="Scopus AI", docs_url="/api/docs", redoc_url=None)
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 db.init()
 
 # Sign-up / login (/api/auth/*); this service's own session cookie.
@@ -119,12 +116,12 @@ def _busy(user_id=None, conversation_id=None) -> bool:
 
 @app.get("/", include_in_schema=False)
 def index_page():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/admin", include_in_schema=False)
 def admin_page():
-    return FileResponse(os.path.join(WEB_DIR, "admin.html"), headers={"Cache-Control": "no-cache"})
+    return FileResponse(os.path.join(STATIC_DIR, "admin.html"), headers={"Cache-Control": "no-cache"})
 
 
 # =====================================================
@@ -353,6 +350,3 @@ def admin_conversation(conversation_id: str, admin: dict = Depends(admin_user)):
         raise HTTPException(404, "Conversation not found.")
     return conv
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860, access_log=False)

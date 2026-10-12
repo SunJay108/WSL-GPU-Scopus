@@ -8,7 +8,7 @@ Command-line ingest (the web UI of the embedding service does the same).
 import argparse
 import sys
 
-from config import IMPORT_ROOT, MARIADB_STAGING_DB
+from core.config import IMPORT_ROOT, MARIADB_STAGING_DB
 from embedding_service.errors import IngestCancelled, IngestError
 from embedding_service.pipeline import run_ingest
 
