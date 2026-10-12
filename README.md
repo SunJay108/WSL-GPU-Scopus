@@ -119,6 +119,12 @@ chmod +x scripts/*.sh
 This builds `scopus-ai-gpu:1.1` (llama-cpp-python compiled with CUDA), pulls Qdrant and MariaDB,
 and starts all four containers.
 
+If `scopus-ai-gpu:1.0` already exists, `./scripts/upgrade_image.sh` is much faster: it builds 1.1 on
+top of 1.0 (`Dockerfile.upgrade`: adds PyMySQL and recompiles llama.cpp for RTX 20xx–40xx GPUs),
+reusing all other layers.
+
+For a fully offline PC, export the whole WSL distro – see `Deploy-GPU-Project-Offline.md`.
+
 ## 6. Build the index (embedding service)
 
 1. Open **http://localhost:7861**.

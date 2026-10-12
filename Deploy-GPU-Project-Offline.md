@@ -1,3 +1,55 @@
+# 7. Prepare and export Scopus Ubuntu on the online PC
+
+The WSL export contains everything the offline PC needs: Ubuntu, Docker Engine,
+NVIDIA Container Toolkit, the Docker images and `~/Scopus` (code, models, data, index).
+
+## Offline PC requirements
+
+Only WSL 2 and the NVIDIA Windows driver need to be installed, but they must match the image:
+
+```text
+GPU      NVIDIA RTX 20xx / GTX 16xx or newer (compute capability 7.5+)
+Driver   NVIDIA Windows driver 580 or newer (the image's PyTorch uses CUDA 13.0)
+CPU      x86-64 with AVX2 (Intel 4th gen / AMD Ryzen or newer)
+Disk     about 60 GB for the imported distro, plus space for the TAR file
+RAM      16 GB recommended
+```
+
+Check the driver on the offline PC in PowerShell with `nvidia-smi` (top right: `Driver Version`).
+
+## Build the image (online, once)
+
+Inside Ubuntu-24.04:
+
+```bash
+cd ~/Scopus
+./scripts/upgrade_image.sh     # scopus-ai-gpu:1.0 -> 1.1 (+ MariaDB image)
+docker compose up -d
+```
+
+Check http://localhost:7861 (embedding service) and http://localhost:7860 (search).
+Optionally build the index now (embedding service → folder `mysql` → **Start ingest**) so the
+offline PC starts with a ready index.
+
+## Export
+
+In Windows PowerShell:
+
+```powershell
+wsl --shutdown
+mkdir D:\WSL-Backup
+wsl --export Ubuntu-24.04 D:\WSL-Backup\Scopus-Ubuntu24.tar
+```
+
+The TAR is about 45–50 GB. Copy it to the offline PC (USB SSD etc.).
+A plain `.tar` imports on every WSL version. If you compress it with 7-Zip for the transfer,
+extract it back to `.tar` before importing.
+
+Files outside the distro are not part of the export, e.g. `C:\Users\<you>\.wslconfig`
+(optional WSL settings) – copy it separately if you use one.
+
+---
+
 # 8. Import Scopus Ubuntu on the offline PC
 
 Create a WSL location:
@@ -120,8 +172,10 @@ docker images
 Expected:
 
 ```text
-scopus-ai-gpu      1.0
+scopus-ai-gpu      1.1
+scopus-ai-gpu      1.0      (base of 1.1; shares its layers, takes no extra space)
 qdrant/qdrant      v1.12.6
+mariadb            10.11.19
 ```
 
 If those images exist, no Internet is required.
@@ -155,8 +209,10 @@ docker ps
 Expected:
 
 ```text
-scopus-ai-gpu
-scopus-qdrant
+scopus-ai-gpu       Scopus search UI
+scopus-embedding    embedding service
+scopus-qdrant       vector database
+scopus-mariadb      reads MySQL table files during an ingest
 ```
 
 Now test the GPU inside Scopus:
@@ -192,6 +248,13 @@ Expected:
 GPU offload: True
 ```
 
+Or run all GPU checks at once:
+
+```bash
+cd ~/Scopus
+./scripts/verify_gpu.sh
+```
+
 ---
 
 # 12. Start Scopus AI normally
@@ -218,10 +281,15 @@ docker ps
 Then on Windows open:
 
 ```text
-http://localhost:7860
+http://localhost:7860     Scopus search
+http://localhost:7861     Embedding service (build / update the index)
 ```
 
 No Internet connection is required.
+
+Keep the Ubuntu window open while you use Scopus: WSL stops the distro (and with it
+all containers) shortly after the last Ubuntu window is closed. The containers start
+again automatically the next time you open `wsl -d ScopusAI`.
 
 ---
 
@@ -234,7 +302,7 @@ cd ~/Scopus
 docker compose down
 ```
 
-This stops both containers.
+This stops all four containers.
 
 Your data remains preserved.
 
@@ -286,6 +354,12 @@ Qdrant logs:
 docker logs scopus-qdrant
 ```
 
+Embedding service (ingest progress is printed here too):
+
+```bash
+docker logs -f scopus-embedding
+```
+
 ---
 
 # 15. Check service ports
@@ -296,11 +370,19 @@ Scopus UI:
 7860
 ```
 
+Embedding service (reachable from this PC only by default):
+
+```text
+7861
+```
+
 Qdrant:
 
 ```text
 6333
 ```
+
+MariaDB has no published port (internal to Docker).
 
 Check:
 
@@ -347,6 +429,7 @@ config.py
 query.py
 filters.py
 main.py
+index_meta.py
 ```
 
 Workflow:
@@ -359,23 +442,42 @@ docker restart scopus-ai-gpu
 
 No rebuild.
 
+For the embedding service (`app/embedding_service/`, `app/ingest.py`) restart that container instead:
+
+```bash
+docker restart scopus-embedding
+```
+
 ---
 
-# 17. Updating `ingest.py`
+# 17. Build the paper index (embedding service)
 
-For `ingest.py`:
+Open:
 
-```bash
-nano app/ingest.py
+```text
+http://localhost:7861
 ```
 
-You usually do not need to restart because:
+1. **Select data folder** – click the folder that contains the MySQL table files
+   (`.frm`, `.MYD`, `.MYI`), e.g. `mysql`. Folders with data show a badge such as `3 tables`.
+2. Untick tables you do not want.
+3. Mode: **Replace index** (fresh index) or **Add to index** (only new DOIs are added).
+4. Press **Start ingest** and follow the progress. An alert appears when it is finished.
+
+The search page switches to the new index automatically; no restart is needed.
+Searches keep using the old index while the ingest runs, and a failed or cancelled ingest
+changes nothing.
+
+The folders shown in the embedding service are those under `~/Scopus/app/data`
+(`IMPORT_DIR` in `~/Scopus/.env`).
+
+Command-line alternative:
 
 ```bash
-docker exec -it scopus-ai-gpu python ingest.py
+cd ~/Scopus
+./scripts/ingest.sh mysql                  # replace
+./scripts/ingest.sh mysql --mode append    # add
 ```
-
-starts a new Python process.
 
 ---
 
@@ -394,10 +496,10 @@ summary settings
 continuation settings
 ```
 
-You should rebuild when changing:
+You should rebuild (embedding service, **Replace index**) when changing:
 
 ```text
-RIS papers
+the MySQL / RIS source data (removing papers)
 embedding model
 embedding dimension
 chunk size
@@ -406,43 +508,31 @@ stored metadata
 index design
 ```
 
-To rebuild:
-
-```bash
-docker exec -it scopus-ai-gpu python ingest.py
-```
-
-Your updated ingestion uses a longer Qdrant timeout and CUDA embeddings.
+New papers alone do not need a rebuild: use **Add to index** (section 19).
 
 ---
 
-# 19. Adding new RIS papers offline
+# 19. Adding new papers offline
 
-Copy your RIS file to:
-
-```text
-~/Scopus/app/data/ris_index/
-```
-
-For example:
+Copy the new data into its own folder under `~/Scopus/app/data/`, for example a new MySQL export:
 
 ```bash
-cp new_papers.ris ~/Scopus/app/data/ris_index/
+mkdir -p ~/Scopus/app/data/mysql_2026_06
+cp /mnt/e/export/*.frm /mnt/e/export/*.MYD /mnt/e/export/*.MYI ~/Scopus/app/data/mysql_2026_06/
 ```
 
-Check:
+or RIS files:
 
 ```bash
-ls -lh ~/Scopus/app/data/ris_index
+mkdir -p ~/Scopus/app/data/ris_new
+cp new_papers.ris ~/Scopus/app/data/ris_new/
 ```
 
-Then rebuild:
+You can also use **Upload folder from this PC…** in the embedding service, which copies a
+Windows folder for you.
 
-```bash
-docker exec -it scopus-ai-gpu python ingest.py
-```
-
-Important: your current ingestion pipeline recreates the `papers` collection, so this is a **full rebuild**, not an incremental update.
+Then in http://localhost:7861 open that folder, choose **Add to index** and press **Start ingest**.
+Papers whose DOI is already indexed are skipped.
 
 ---
 
@@ -451,11 +541,20 @@ Important: your current ingestion pipeline recreates the `papers` collection, so
 Your v1.2 system can use:
 
 ```text
-multilingual-e5-small → CUDA GPU
+multilingual-e5-small → CUDA GPU (search + embedding service, fp16 during ingest)
 Qwen2.5 GGUF          → CUDA GPU
 BGE reranker          → GPU where supported
 Qdrant                → CPU
-BM25                   → CPU
+BM25                  → CPU
+MariaDB               → CPU (only during an ingest)
+```
+
+On a 6 GB GPU the search UI (LLM + embedding + reranker ≈ 5 GB) and an ingest share the
+GPU memory. Both work, but an ingest is about 1.5x faster with the search UI stopped:
+
+```bash
+docker stop scopus-ai-gpu       # before a large ingest
+docker start scopus-ai-gpu      # afterwards
 ```
 
 Check GPU utilization while asking a question:
@@ -518,31 +617,29 @@ It is primarily the size of one generation segment.
 
 # 22. Configuration file
 
-Main configuration:
+Runtime settings live in `.env` (they override the defaults in `app/config.py`):
 
 ```bash
-nano ~/Scopus/app/config.py
+nano ~/Scopus/.env
 ```
 
 Typical runtime values:
 
-```python
-LLM_CTX = 4096
-LLM_BATCH = 256
-LLM_THREADS = 4
-LLM_GPU_LAYERS = -1
+```text
+LLM_CTX=4096
+LLM_BATCH=256
+LLM_THREADS=4
+LLM_GPU_LAYERS=-1        # -1 = full GPU offload
+EMBED_BATCH_SIZE=128
+EMBED_FP16=true
+IMPORT_DIR=./app/data    # folders shown in the embedding service
 ```
 
-Full GPU layer offload:
-
-```python
-LLM_GPU_LAYERS = -1
-```
-
-After changing `config.py`:
+After changing `.env`, recreate the containers (`docker restart` does not re-read `.env`):
 
 ```bash
-docker restart scopus-ai-gpu
+cd ~/Scopus
+docker compose up -d
 ```
 
 ---
@@ -573,6 +670,9 @@ CUDA build configuration
 llama-cpp-python build
 system Linux packages
 ```
+
+Such rebuilds need Internet, so do them on the online PC (`./scripts/upgrade_image.sh` for the
+quick 1.0 → 1.1 path, `./scripts/build_online.sh` for a full rebuild) and export the distro again.
 
 ---
 
@@ -613,7 +713,10 @@ http://localhost:7860
 
 Ask a research question.
 
-If it works, your system is truly offline.
+Then open http://localhost:7861, select a small folder (or untick all but one table) and
+run an ingest with **Add to index**.
+
+If both work, your system is truly offline.
 
 ---
 
@@ -667,7 +770,17 @@ Then:
 docker logs --tail 100 scopus-ai-gpu
 ```
 
-If both need restarting:
+If the embedding service is unavailable or an ingest fails:
+
+```bash
+docker logs --tail 100 scopus-embedding
+docker restart scopus-embedding
+```
+
+The embedding page also shows a status chip for Qdrant, MariaDB and the GPU.
+"MariaDB unreachable" right after the first start is normal for ~20 seconds.
+
+If everything needs restarting:
 
 ```bash
 cd ~/Scopus
@@ -760,7 +873,8 @@ docker compose up -d
 Windows browser:
 
 ```text
-http://localhost:7860
+http://localhost:7860     search
+http://localhost:7861     embedding service (only when adding data)
 ```
 
 When finished:
@@ -784,10 +898,12 @@ docker compose up -d
 docker ps
 
 # Open browser
-http://localhost:7860
+http://localhost:7860          # search
+http://localhost:7861          # embedding service
 
 # GPU status
 nvidia-smi
+./scripts/verify_gpu.sh
 
 # GPU inside container
 docker exec scopus-ai-gpu nvidia-smi
@@ -797,6 +913,7 @@ curl http://localhost:6333/collections
 
 # App logs
 docker logs -f scopus-ai-gpu
+docker logs -f scopus-embedding
 
 # Restart app only
 docker restart scopus-ai-gpu
@@ -805,7 +922,7 @@ docker restart scopus-ai-gpu
 docker restart scopus-qdrant
 
 # Rebuild research index
-docker exec -it scopus-ai-gpu python ingest.py
+http://localhost:7861  (or ./scripts/ingest.sh mysql)
 
 # Stop
 docker compose down

@@ -14,6 +14,7 @@ import html
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 
 from config import (
@@ -239,26 +240,39 @@ def _quote(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
 
-def mariadb_connect(database=None, connect_timeout=10, **kwargs):
+def mariadb_connect(database=None, connect_timeout=10, wait=0, rep=None, **kwargs):
+    """Connect to MariaDB; with wait > 0, keep retrying while the server is still starting."""
     import pymysql
 
-    try:
-        return pymysql.connect(
-            host=MARIADB_HOST,
-            port=MARIADB_PORT,
-            user=MARIADB_USER,
-            password=MARIADB_PASSWORD,
-            database=database,
-            charset="utf8mb4",
-            autocommit=True,
-            connect_timeout=connect_timeout,
-            **kwargs,
-        )
-    except pymysql.err.OperationalError as exc:
-        raise IngestError(
-            f"Cannot connect to MariaDB at {MARIADB_HOST}:{MARIADB_PORT} "
-            f"({exc.args[-1]}). Is the 'mariadb' service running?"
-        ) from exc
+    deadline = time.time() + wait
+    waiting_logged = False
+    while True:
+        try:
+            return pymysql.connect(
+                host=MARIADB_HOST,
+                port=MARIADB_PORT,
+                user=MARIADB_USER,
+                password=MARIADB_PASSWORD,
+                database=database,
+                charset="utf8mb4",
+                autocommit=True,
+                connect_timeout=connect_timeout,
+                **kwargs,
+            )
+        except pymysql.err.OperationalError as exc:
+            # 2002/2003: cannot connect (e.g. MariaDB initialising on first start)
+            if exc.args[0] in (2002, 2003) and time.time() < deadline:
+                if rep is not None:
+                    if not waiting_logged:
+                        rep.log("Waiting for MariaDB to start...")
+                        waiting_logged = True
+                    rep.check_cancel()
+                time.sleep(2)
+                continue
+            raise IngestError(
+                f"Cannot connect to MariaDB at {MARIADB_HOST}:{MARIADB_PORT} "
+                f"({exc.args[-1]}). Is the 'mariadb' service running?"
+            ) from exc
 
 
 class MariaDBStaging:
@@ -282,7 +296,7 @@ class MariaDBStaging:
         total = sum(t.size for t in tables)
         self.rep.begin("stage", total=total, detail=f"Copying {len(tables)} table(s) into MariaDB")
 
-        with mariadb_connect() as conn, conn.cursor() as cur:
+        with mariadb_connect(wait=120, rep=self.rep) as conn, conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {_quote(self.database)}")
             cur.execute(f"CREATE DATABASE {_quote(self.database)} CHARACTER SET utf8mb4")
         self._created = True

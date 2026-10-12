@@ -1,11 +1,15 @@
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 
+# llama.cpp build flags: no GPU is visible during docker build, so name the GPU
+# generations explicitly (75 = RTX 20xx/GTX 16xx, 86 = RTX 30xx, 89 = RTX 40xx,
+# plus PTX for newer GPUs) and build for a generic AVX2 CPU instead of this PC's CPU.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH" \
-    CMAKE_ARGS="-DGGML_CUDA=on" \
+    CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;89-real;89-virtual -DGGML_NATIVE=OFF" \
+    CMAKE_BUILD_PARALLEL_LEVEL=6 \
     FORCE_CMAKE=1
 
 WORKDIR /app
@@ -30,7 +34,6 @@ RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 
 # Rebuild llama-cpp-python with CUDA support.
 RUN python -m pip uninstall -y llama-cpp-python || true && \
-    CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 \
     python -m pip install --no-cache-dir --upgrade --force-reinstall llama-cpp-python
 
 COPY app /app/app

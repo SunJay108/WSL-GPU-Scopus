@@ -4,6 +4,8 @@ import re
 import threading
 
 import numpy as np
+# torch must be imported before llama_cpp (via LlamaCPP below): llama.cpp links
+# the system NCCL, and loading it first breaks torch ("undefined symbol: ncclCommResume").
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
 
