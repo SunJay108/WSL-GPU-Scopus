@@ -278,7 +278,7 @@
           icon("search"), `Searched for: ${data.standalone_question}`));
       }
       if (data.notice) body.append(el("div", { class: "notice no_results compact" }, data.notice));
-      body.append(sectionLabel("Summary"), md(data.summary, null, "summary"));
+      body.append(sectionLabel("Summary"), md(data.summary, prefix, "summary"));
       body.append(sectionLabel("Detailed answer"), md(data.answer, prefix));
       if (data.references && data.references.length) {
         body.append(sectionLabel("References"), renderReferences(data.references, prefix));

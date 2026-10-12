@@ -34,3 +34,6 @@ desktop.ini
 
 # Load test results (scripts/load_test.sh)
 loadtest_results/
+
+# llama.cpp source archive for Dockerfile.llm (scripts/get_llama_server_source.sh)
+third_party/

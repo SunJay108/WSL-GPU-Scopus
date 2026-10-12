@@ -46,7 +46,6 @@ def _clamp(value, minimum, maximum):
 
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/app/models/multilingual-e5-small")
 RERANKER_PATH = os.getenv("RERANKER_PATH", "/app/models/bge-reranker-base")
-LLM_PATH = os.getenv("LLM_PATH", "/app/models/qwen2.5-3b-instruct-q4_k_m.gguf")
 
 # "cuda" is preferred; both services fall back to the CPU when CUDA is unavailable.
 EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cuda").strip().lower()
@@ -80,33 +79,26 @@ SESSION_DAYS = _clamp(_env_int("SESSION_DAYS", 7), 1, 365)
 # =====================================================
 
 SEARCH_SERVICE_PORT = _clamp(_env_int("SEARCH_SERVICE_PORT", 7860), 1, 65535)
+# Load all models when the service starts instead of at the first question.
+PRELOAD_MODELS = _env_bool("PRELOAD_MODELS", True)
 
-LLM_CTX = _clamp(_env_int("LLM_CTX", 4096), 3072, 8192)
-LLM_BATCH = _clamp(_env_int("LLM_BATCH", 256), 32, 1024)
-LLM_THREADS = _clamp(_env_int("LLM_THREADS", 4), 1, 32)
-# -1 offloads all layers to the GPU; other negative values mean the same.
-_gpu_layers = _env_int("LLM_GPU_LAYERS", -1)
-LLM_GPU_LAYERS = -1 if _gpu_layers < 0 else min(_gpu_layers, 200)
+# The model runs in its own service (llama.cpp llama-server, compose service
+# "llm"); its model file, context and GPU settings are set there.
+LLM_URL = os.getenv("LLM_URL", "http://llm:8080")
+LLM_TIMEOUT = _clamp(_env_int("LLM_TIMEOUT", 300), 10, 3600)
+# Questions answered at the same time.  Must equal the server's parallel slots
+# (docker-compose.yml passes the same LLM_PARALLEL to both).
+LLM_PARALLEL = _clamp(_env_int("LLM_PARALLEL", 1), 1, 64)
 
-# Tokens per generation call.  Unfinished answers are continued automatically
-# (up to LLM_MAX_CONTINUATIONS calls), so this does not limit the final answer.
-LLM_MAX_NEW_TOKENS = _clamp(_env_int("LLM_MAX_NEW_TOKENS", 512), 128, 2048)
-LLM_MAX_CONTINUATIONS = _clamp(_env_int("LLM_MAX_CONTINUATIONS", 6), 1, 12)
-
-LLM_TEMPERATURE = _clamp(_env_float("LLM_TEMPERATURE", 0.10), 0.0, 1.5)
-LLM_REPEAT_PENALTY = _clamp(_env_float("LLM_REPEAT_PENALTY", 1.18), 1.0, 1.5)
+# Greedy decoding (temperature 0) keeps answers close to the sources.
+LLM_TEMPERATURE = _clamp(_env_float("LLM_TEMPERATURE", 0.0), 0.0, 1.5)
+LLM_REPEAT_PENALTY = _clamp(_env_float("LLM_REPEAT_PENALTY", 1.1), 1.0, 1.5)
 LLM_TOP_P = _clamp(_env_float("LLM_TOP_P", 0.90), 0.05, 1.0)
 LLM_TOP_K = _clamp(_env_int("LLM_TOP_K", 40), 1, 200)
 
-SUMMARY_MAX_CONTINUATIONS = _clamp(_env_int("SUMMARY_MAX_CONTINUATIONS", 2), 1, 4)
-SUMMARY_MAX_SENTENCES = _clamp(_env_int("SUMMARY_MAX_SENTENCES", 4), 2, 6)
-SUMMARY_MAX_WORDS = _clamp(_env_int("SUMMARY_MAX_WORDS", 140), 60, 300)
-
-# Characters of the unfinished answer shown to the model when continuing it.
-CONTINUATION_TAIL_CHARS = _clamp(_env_int("CONTINUATION_TAIL_CHARS", 3000), 1000, 8000)
-
-# Marker requested from the model when a response is truly complete.
-END_MARKER = "<END_OF_ANSWER>"
+# Longest answer (tokens, about 4 characters each) and summary.
+LLM_ANSWER_TOKENS = _clamp(_env_int("LLM_ANSWER_TOKENS", 900), 200, 4096)
+SUMMARY_MAX_TOKENS = _clamp(_env_int("SUMMARY_MAX_TOKENS", 220), 60, 600)
 
 
 # =====================================================
@@ -126,6 +118,15 @@ RERANK_TOP_N = _clamp(_env_int("RERANK_TOP_N", 5), 1, 20)
 RELEVANCE_MIN_SCORE = _clamp(_env_float("RELEVANCE_MIN_SCORE", 0.1), 0.0, 1.0)
 RELEVANCE_WARN_SCORE = _clamp(_env_float("RELEVANCE_WARN_SCORE", 0.3), 0.0, 1.0)
 SOURCE_MIN_SCORE = _clamp(_env_float("SOURCE_MIN_SCORE", 0.05), 0.0, 1.0)
+# Papers the answer is written from (= the references listed under it).
+ANSWER_SOURCES = _clamp(_env_int("ANSWER_SOURCES", 5), 1, 10)
+
+# Every answer and summary sentence must be supported by those papers
+# (search_service/grounding.py): cross-encoder score of the sentence against
+# its best source passage >= GROUNDING_MIN_SCORE, and every number and name in
+# it must occur in the sources.  Unsupported sentences are not shown.
+GROUNDING = _env_bool("GROUNDING", True)
+GROUNDING_MIN_SCORE = _clamp(_env_float("GROUNDING_MIN_SCORE", 0.3), 0.0, 1.0)
 
 # "llm": the language model judges whether a question is research
 # (search_service/guard.py); "keywords": every keyword in

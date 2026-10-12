@@ -1,0 +1,35 @@
+# Language model server: llama.cpp llama-server (compose service "llm").
+#
+#   ./scripts/get_llama_server_source.sh     download the source archive (online PC)
+#   docker compose build llm                 (./scripts/build_online.sh runs both)
+#
+# Built on the app image, which already has CUDA and the compilers, so the new
+# image only adds the server binary and the offline bundle hardly grows.  The
+# source archive is copied in from third_party/ (no network during the build).
+#
+# CUDA kernels: compute 7.5 (RTX 20xx / GTX 16xx), 8.6 (RTX 30xx, A-series),
+# 8.9 (RTX 40xx, L4/L40) and PTX that newer GPUs compile at first start.
+# Add e.g. 80-real (A100) or 90-real (H100) to CUDA_ARCHITECTURES for those.
+
+ARG BASE=scopus-ai-gpu:1.1
+
+FROM ${BASE} AS build
+ARG LLAMA_CPP_VERSION=b10991
+ARG CUDA_ARCHITECTURES="75-real;86-real;89-real;89-virtual"
+COPY third_party/llama.cpp-${LLAMA_CPP_VERSION}.tar.gz /tmp/
+RUN tar xzf /tmp/llama.cpp-${LLAMA_CPP_VERSION}.tar.gz -C /tmp \
+ && cmake -S /tmp/llama.cpp-${LLAMA_CPP_VERSION} -B /tmp/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=ON -DGGML_NATIVE=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
+      -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF \
+      -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+ && cmake --build /tmp/build --target llama-server -j"$(nproc)"
+
+FROM ${BASE}
+COPY --from=build /tmp/build/bin/llama-server /usr/local/bin/llama-server
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/llama-server"]
+CMD ["--help"]

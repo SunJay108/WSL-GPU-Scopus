@@ -2,6 +2,7 @@
 #   qdrant            vector database (shared index)
 #   mariadb           reads the MySQL MyISAM files during an ingest (internal only)
 #   scopus-embedding  embedding service: pick a data folder, build the index   http://localhost:7861
+#   llm               language model server (llama.cpp), used by scopus-ai     (internal)
 #   scopus-ai         Scopus search UI using the index                         http://localhost:7860
 
 x-runtime-env: &runtime-env
@@ -77,6 +78,42 @@ services:
       - mariadb_data:/mariadb_data
       - /etc/localtime:/etc/localtime:ro   # show local times instead of UTC
 
+  # Language model server: one copy of the model, LLM_PARALLEL answers at the
+  # same time (continuous batching).  On a larger GPU raise LLM_PARALLEL (and
+  # use a larger model, LLM_MODEL) in .env; nothing else changes.
+  llm:
+    image: scopus-llm:b10991
+    build:
+      context: .
+      dockerfile: Dockerfile.llm
+    container_name: scopus-llm
+    restart: unless-stopped
+    gpus: all
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}
+      LLM_PARALLEL: ${LLM_PARALLEL:-1}
+      LLM_CTX: ${LLM_CTX:-4096}
+      LLM_GPU_LAYERS: ${LLM_GPU_LAYERS:-all}
+      LLM_BATCH: ${LLM_BATCH:-512}
+      LLM_THREADS: ${LLM_THREADS:-4}
+    entrypoint: ["/bin/sh", "-c"]
+    # Each slot gets LLM_CTX tokens of context.
+    command:
+      - >-
+        exec llama-server --host 0.0.0.0 --port 8080
+        --model "/models/$$LLM_MODEL"
+        --parallel "$$LLM_PARALLEL" --ctx-size "$$((LLM_CTX * LLM_PARALLEL))"
+        --n-gpu-layers "$$LLM_GPU_LAYERS" --batch-size "$$LLM_BATCH" --threads "$$LLM_THREADS"
+        --no-webui --metrics
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
   scopus-ai:
     image: scopus-ai-gpu:1.1
     build:
@@ -87,32 +124,33 @@ services:
     command: ["python", "-m", "search_service"]
     depends_on:
       - qdrant
+      - llm
     ports:
       - "7860:7860"
     gpus: all
     environment:
       <<: *runtime-env
       RERANKER_PATH: /app/models/bge-reranker-base
-      LLM_PATH: /app/models/qwen2.5-3b-instruct-q4_k_m.gguf
-
       RERANK_DEVICE: ${RERANK_DEVICE:-cuda}
 
-      LLM_CTX: ${LLM_CTX:-4096}
-      LLM_BATCH: ${LLM_BATCH:-256}
-      LLM_THREADS: ${LLM_THREADS:-4}
-      LLM_GPU_LAYERS: ${LLM_GPU_LAYERS:--1}
-      LLM_MAX_NEW_TOKENS: ${LLM_MAX_NEW_TOKENS:-512}
-      LLM_MAX_CONTINUATIONS: ${LLM_MAX_CONTINUATIONS:-6}
-
-      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.10}
-      LLM_REPEAT_PENALTY: ${LLM_REPEAT_PENALTY:-1.18}
+      # Language model server (service "llm"); same LLM_PARALLEL as there
+      LLM_URL: http://llm:8080
+      LLM_PARALLEL: ${LLM_PARALLEL:-1}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.0}
+      LLM_REPEAT_PENALTY: ${LLM_REPEAT_PENALTY:-1.1}
       LLM_TOP_P: ${LLM_TOP_P:-0.90}
       LLM_TOP_K: ${LLM_TOP_K:-40}
+      LLM_ANSWER_TOKENS: ${LLM_ANSWER_TOKENS:-900}
+      PRELOAD_MODELS: ${PRELOAD_MODELS:-true}
 
       # Question guard and answer quality (see app/search_service/guard.py, app/core/config.py)
       GUARD_MODE: ${GUARD_MODE:-llm}
       RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
       RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}
+      ANSWER_SOURCES: ${ANSWER_SOURCES:-5}
+      # Only sentences supported by the papers are shown (app/search_service/grounding.py)
+      GROUNDING: ${GROUNDING:-true}
+      GROUNDING_MIN_SCORE: ${GROUNDING_MIN_SCORE:-0.3}
       SUGGEST_FOLLOWUPS: ${SUGGEST_FOLLOWUPS:-true}
       SEARCH_FP16: ${SEARCH_FP16:-true}
 

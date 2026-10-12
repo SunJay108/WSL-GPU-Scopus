@@ -7,3 +7,6 @@ app/data/
 .git/
 __pycache__/
 *.pyc
+third_party/llama.cpp-*/
+loadtest_results/
+!third_party/llama.cpp-*.tar.gz

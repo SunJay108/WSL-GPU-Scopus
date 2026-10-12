@@ -17,7 +17,7 @@ in a new chat, so an earlier topic can never take over a new question:
 import re
 
 from core.config import HISTORY_TURNS
-from .guard import yes_no_grammar
+from .guard import YES_NO_GRAMMAR
 
 # Words that point back to an earlier turn.
 _REFERRING_WORDS = {
@@ -98,7 +98,7 @@ def needs_context(question, chat) -> bool:
     for example, label in CONTEXT_EXAMPLES:
         messages += [{"role": "user", "content": example}, {"role": "assistant", "content": label}]
     messages.append({"role": "user", "content": question})
-    return chat(messages, max_tokens=2, grammar=yes_no_grammar()).strip().upper() == "YES"
+    return chat(messages, max_tokens=2, grammar=YES_NO_GRAMMAR).strip().upper() == "YES"
 
 
 def _stem(word):

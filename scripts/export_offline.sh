@@ -8,9 +8,14 @@ mkdir -p "$OUT/images"
 docker image inspect scopus-ai-gpu:1.1 >/dev/null
 docker image inspect qdrant/qdrant:v1.12.6 >/dev/null
 docker image inspect mariadb:10.11.19 >/dev/null
+# Language model server image (pinned in docker-compose.yml).
+LLM_IMAGE=$(grep -o 'scopus-llm:[^ ]*' "$ROOT/docker-compose.yml" | head -1)
+docker image inspect "$LLM_IMAGE" >/dev/null
 
 echo 'Saving Docker images...'
-docker save scopus-ai-gpu:1.1 -o "$OUT/images/scopus-ai-gpu-1.1.tar"
+# The app image and the language model server image share almost all layers:
+# one archive stores them once.
+docker save scopus-ai-gpu:1.1 "$LLM_IMAGE" -o "$OUT/images/scopus-ai-gpu-1.1.tar"
 docker save qdrant/qdrant:v1.12.6 -o "$OUT/images/qdrant-1.12.6.tar"
 docker save mariadb:10.11.19 -o "$OUT/images/mariadb-10.11.19.tar"
 

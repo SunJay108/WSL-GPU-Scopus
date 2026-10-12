@@ -11,6 +11,7 @@
     no_results: ["No relevant papers", "warn"],
     no_index: ["No index", "warn"],
     blocked: ["Blocked", "err"],
+    unavailable: ["Model unavailable", "err"],
     error: ["Error", "err"],
   };
 
@@ -70,6 +71,7 @@
           el("div", { class: "detail-sub" }, badge(note, cls),
             d.searched_as ? ` searched as “${d.searched_as}”` : "",
             d.reason && d.status === "blocked" ? ` · ${d.reason}` : "",
+            d.removed_sentences ? ` · ${d.removed_sentences} unsupported sentence(s) removed` : "",
             d.seconds ? ` · ${d.seconds} s` : ""),
         ];
       }

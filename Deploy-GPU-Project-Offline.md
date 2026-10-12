@@ -210,10 +210,13 @@ Expected:
 
 ```text
 scopus-ai-gpu       Scopus search UI
+scopus-llm          language model server (llama.cpp), used by the search UI
 scopus-embedding    embedding service
 scopus-qdrant       vector database
 scopus-mariadb      reads MySQL table files during an ingest
 ```
+
+`docker ps` shows `scopus-llm` as `(healthy)` once the model is loaded (up to a minute after start).
 
 Now test the GPU inside Scopus:
 
@@ -235,17 +238,16 @@ CUDA: True
 NVIDIA ...
 ```
 
-Test llama.cpp GPU support:
+Test the language model server after the first question (speed of the last requests):
 
 ```bash
-docker exec -it scopus-ai-gpu python -c \
-"from llama_cpp import llama_cpp; print('GPU offload:', llama_cpp.llama_supports_gpu_offload())"
+docker logs scopus-llm 2>&1 | grep "prompt eval time" | tail -3
 ```
 
-Expected:
+Expected: several hundred tokens per second or more (on the GPU), not a few dozen (CPU):
 
 ```text
-GPU offload: True
+prompt eval time =  605.71 ms /  560 tokens ( 1.08 ms per token,  924.53 tokens per second)
 ```
 
 Or run all GPU checks at once:
@@ -374,6 +376,18 @@ Embedding service (ingest progress is printed here too):
 
 ```bash
 docker logs -f scopus-embedding
+```
+
+Language model server (model loading, GPU offload, requests):
+
+```bash
+docker logs scopus-llm
+```
+
+Readiness of the search service (models, language model server, index) without signing in:
+
+```bash
+curl -s http://localhost:7860/api/health
 ```
 
 ---
@@ -589,45 +603,24 @@ GPU memory and utilization should increase.
 
 ---
 
-# 21. Output truncation protection in v1.2
+# 21. Answers only from the indexed papers
 
-Your v1.2 system includes:
-
-```text
-bounded configuration
-+
-automatic continuation
-+
-explicit <END_OF_ANSWER>
-+
-complete-sentence cleanup
-```
-
-So:
+Each answer is written in one call to the language model server from the numbered source papers, and
+every sentence is checked against those papers before it is shown (see "Answers only from the indexed
+papers" in `README.md`):
 
 ```text
-generation chunk
-      ↓
-not finished
-      ↓
-automatic continuation
-      ↓
-not finished
-      ↓
-automatic continuation
-      ↓
-<END_OF_ANSWER>
-      ↓
-combine
-      ↓
-remove END marker
-      ↓
-display complete answer
+question → guard → search → numbered sources → model writes with citations
+        → each finished sentence: supported by a source? numbers and names in the sources?
+        → only supported sentences are shown → summary (checked the same way)
 ```
 
-Therefore `LLM_MAX_NEW_TOKENS` is no longer necessarily the maximum final answer length.
+`LLM_ANSWER_TOKENS` (default 900, about 3,500 characters) is the longest answer; an answer cut off at the
+limit loses only its unfinished last sentence. Removed sentences are logged:
 
-It is primarily the size of one generation segment.
+```bash
+docker logs scopus-ai-gpu | grep Grounding
+```
 
 ---
 
@@ -642,14 +635,17 @@ nano ~/Scopus/.env
 Typical runtime values:
 
 ```text
-LLM_CTX=4096
-LLM_BATCH=256
-LLM_THREADS=4
-LLM_GPU_LAYERS=-1        # -1 = full GPU offload
+LLM_MODEL=qwen2.5-3b-instruct-q4_k_m.gguf   # model file in ./models
+LLM_PARALLEL=1           # answers written at the same time (raise on a larger GPU)
+LLM_CTX=4096             # context per answer
+LLM_GPU_LAYERS=all       # all model layers on the GPU
 EMBED_BATCH_SIZE=128
 EMBED_FP16=true
 IMPORT_DIR=./app/data    # folders shown in the embedding service
 ```
+
+On a larger GPU on the offline PC, raise `LLM_PARALLEL` (and optionally use a larger model) and measure
+with `./scripts/load_test.sh -e LLM_PARALLEL=4` (see section 24).
 
 After changing `.env`, recreate the containers (`docker restart` does not re-read `.env`):
 
@@ -683,7 +679,7 @@ Dockerfile
 requirements.txt
 Python libraries/packages
 CUDA build configuration
-llama-cpp-python build
+language model server (Dockerfile.llm, llama.cpp version)
 system Linux packages
 ```
 

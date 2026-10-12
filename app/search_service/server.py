@@ -13,6 +13,9 @@ Accounts (web_auth.py)
     POST /api/auth/logout           sign out
     POST /api/auth/password         change own password
 
+Monitoring (no sign-in)
+    GET    /api/health              models, language model server and index ready?
+
 Chats (own chats only)
     GET    /api/status              index + model state
     GET    /api/conversations?q=    history list (optionally searched)
@@ -30,29 +33,41 @@ Admin
     PATCH /api/admin/users/{id}     disable/enable, change role, reset password
 """
 
+import asyncio
 import json
 import os
-import queue
 import re
 import threading
 import traceback
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from core import audit, auth, db
-from . import history
-from .query import answer_question, index_info, models_loaded
+from core.config import PRELOAD_MODELS
+from . import history, llm
+from .query import answer_question, index_info, models_loaded, preload
 from core.web_auth import WebAuth, client_ip as _ip
 
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app = FastAPI(title="Scopus AI", docs_url="/api/docs", redoc_url=None)
+
+@asynccontextmanager
+async def lifespan(_app):
+    # Load the models in the background so the first question does not wait.
+    if PRELOAD_MODELS:
+        threading.Thread(target=preload, name="preload", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Scopus AI", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 db.init()
 
@@ -122,6 +137,14 @@ def index_page():
 @app.get("/admin", include_in_schema=False)
 def admin_page():
     return FileResponse(os.path.join(STATIC_DIR, "admin.html"), headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/health")
+def health():
+    """For monitoring and container health checks; 503 until everything is loaded."""
+    state = {"models": models_loaded(), "llm": llm.healthy(), "index": bool(index_info().get("ready"))}
+    ready = state["models"] and state["llm"]
+    return JSONResponse({"status": "ok" if ready else "loading", **state}, status_code=200 if ready else 503)
 
 
 # =====================================================
@@ -200,23 +223,30 @@ def export_conversation(conversation_id: str, request: Request, user: dict = Dep
 
 
 @app.post("/api/conversations/{conversation_id}/ask")
-def ask(conversation_id: str, body: AskBody, request: Request, user: dict = Depends(current_user)):
+async def ask(conversation_id: str, body: AskBody, request: Request, user: dict = Depends(current_user)):
+    # async: a waiting answer stream holds no worker thread, so many users can
+    # wait for answers without slowing the rest of the site down.  Database
+    # calls run in the thread pool so they never block the event loop.
     question = body.question.strip()
     if not question:
         raise HTTPException(400, "Please enter a question.")
     if len(question) > 2000:
         raise HTTPException(400, "The question is too long (maximum 2000 characters).")
-    _own_conversation(conversation_id, user)
+    await run_in_threadpool(_own_conversation, conversation_id, user)
 
     with _pending_lock:
         if conversation_id in _pending:
             raise HTTPException(409, "This conversation is still being answered.")
         _pending[conversation_id] = {"user_id": user["id"], "stage": "queued", "text": "Starting…", "partial": ""}
 
-    turns = history.context_turns(conversation_id)
-    user_message = history.add_message(conversation_id, "user", question)
-    events = queue.Queue()
+    turns = await run_in_threadpool(history.context_turns, conversation_id)
+    user_message = await run_in_threadpool(history.add_message, conversation_id, "user", question)
+    loop = asyncio.get_running_loop()
+    events = asyncio.Queue()
     ip = _ip(request)
+
+    def put(item):
+        loop.call_soon_threadsafe(events.put_nowait, item)
 
     def progress(event, **data):
         with _pending_lock:
@@ -226,7 +256,7 @@ def ask(conversation_id: str, body: AskBody, request: Request, user: dict = Depe
                     state.update(stage=data["stage"], text=data["text"])
                 elif event == "delta":
                     state["partial"] = data["text"]
-        events.put((event, data))
+        put((event, data))
 
     def work():
         try:
@@ -241,9 +271,10 @@ def ask(conversation_id: str, body: AskBody, request: Request, user: dict = Depe
                 "reason": guard.get("reason"),
                 "searched_as": result.get("standalone_question"),
                 "top_score": result.get("top_score"),
+                "removed_sentences": (result.get("grounding") or {}).get("removed"),
                 "seconds": result.get("seconds"),
             }, ip=ip)
-            events.put(("done", {"message": message}))
+            put(("done", {"message": message}))
         except Exception as exc:
             traceback.print_exc()
             text = f"⚠️ Something went wrong while answering: {exc}"
@@ -252,19 +283,19 @@ def ask(conversation_id: str, body: AskBody, request: Request, user: dict = Depe
             )
             audit.log("ask", user, conversation_id,
                       {"question": question, "status": "error", "error": str(exc)}, ip=ip)
-            events.put(("error", {"message": message}))
+            put(("error", {"message": message}))
         finally:
             with _pending_lock:
                 _pending.pop(conversation_id, None)
 
     threading.Thread(target=work, name=f"answer-{conversation_id[:8]}", daemon=True).start()
 
-    def stream():
+    async def stream():
         yield _sse("user", {"message": user_message})
         while True:
             try:
-                event, data = events.get(timeout=15)
-            except queue.Empty:
+                event, data = await asyncio.wait_for(events.get(), timeout=15)
+            except asyncio.TimeoutError:
                 yield ": keep-alive\n\n"
                 continue
             yield _sse(event, data)

@@ -275,6 +275,18 @@ class StreamGuard(nn.Module):
         }
         self.device_name = device
         self.to(device=device, dtype=dtype).eval()
+        # Answers written at the same time share the model and its tokenizer.
+        self.lock = threading.Lock()
+
+    def encode(self, text, offsets=False):
+        with self.lock:
+            enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=offsets)
+        return (enc["input_ids"], enc["offset_mapping"]) if offsets else enc["input_ids"]
+
+    def chat_text(self, messages):
+        with self.lock:
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False,
+                                                      enable_thinking=False)
 
     def new_cache(self):
         from transformers import DynamicCache
@@ -287,11 +299,12 @@ class StreamGuard(nn.Module):
     def step(self, ids, cache, part):
         """Feed token ids after the cached ones; (risk, category) for each fed token."""
         x = torch.tensor([ids], dtype=torch.long, device=self.device_name)
-        hidden = self.backbone(input_ids=x, past_key_values=cache, use_cache=True).last_hidden_state[0]
-        head = self.heads[part]
-        z = head["norm"](head["pre"](hidden))
-        risks = head["risk"](z).argmax(-1).tolist()
-        categories = head["category"](z).argmax(-1).tolist()
+        with self.lock:
+            hidden = self.backbone(input_ids=x, past_key_values=cache, use_cache=True).last_hidden_state[0]
+            head = self.heads[part]
+            z = head["norm"](head["pre"](hidden))
+            risks = head["risk"](z).argmax(-1).tolist()
+            categories = head["category"](z).argmax(-1).tolist()
         risk_names, category_names = self.labels[part]
         return [(risk_names[r], category_names[c]) for r, c in zip(risks, categories)]
 
@@ -315,7 +328,7 @@ def _load_output():
 class OutputMonitor:
     """
     Checks one answer while it is written.  update(text) with the answer so far
-    (it may also change earlier text, e.g. when a continuation is merged);
+    (if earlier text changes, the check rewinds);
     verified(text) is the part already checked and safe; finish(text) checks
     the rest and returns the Verdict (blocked or not).  The check runs in its
     own thread, so the answer is not slowed down by waiting for it.
@@ -333,10 +346,8 @@ class OutputMonitor:
         self.guard = guard
         tok = guard.tokenizer
         marker = "⁣ANSWER⁣"
-        text = tok.apply_chat_template(
-            [{"role": "user", "content": question}, {"role": "assistant", "content": marker}],
-            tokenize=False, add_generation_prompt=False, enable_thinking=False)
-        prefix_ids = tok(text[:text.index(marker)], add_special_tokens=False).input_ids
+        text = guard.chat_text([{"role": "user", "content": question}, {"role": "assistant", "content": marker}])
+        prefix_ids = guard.encode(text[:text.index(marker)])
         # As in the reference code: the user turn up to its <|im_end|> is read
         # with the query heads, everything after it with the response heads.
         im_end = tok.convert_tokens_to_ids("<|im_end|>")
@@ -411,8 +422,7 @@ class OutputMonitor:
                 self._cond.notify_all()
 
     def _process(self, text, final):
-        enc = self.guard.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        ids, offsets = enc["input_ids"], enc["offset_mapping"]
+        ids, offsets = self.guard.encode(text, offsets=True)
         stable = len(ids) if final else max(0, len(ids) - self.HOLD_BACK)
 
         # Rewind if earlier text changed.

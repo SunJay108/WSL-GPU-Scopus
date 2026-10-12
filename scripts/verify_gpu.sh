@@ -9,8 +9,10 @@ echo '=== Docker GPU ==='
 docker exec scopus-ai-gpu nvidia-smi
 
 echo
-echo '=== llama.cpp GPU offload support ==='
-docker exec scopus-ai-gpu python3 -c 'from llama_cpp import llama_cpp; print("llama_supports_gpu_offload =", llama_cpp.llama_supports_gpu_offload())'
+echo '=== Language model server (llama.cpp) ==='
+docker exec scopus-llm python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/health').read().decode())"
+# Speed of the last requests: hundreds of tokens per second or more = GPU.
+docker logs scopus-llm 2>&1 | grep -E "prompt eval time|  eval time" | tail -2
 
 echo
 echo '=== PyTorch CUDA (Scopus UI) ==='

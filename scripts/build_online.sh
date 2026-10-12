@@ -6,9 +6,11 @@ cp -n .env.example .env 2>/dev/null || true
 echo 'Building GPU image (used by both the Scopus UI and the embedding service)...'
 docker compose build --no-cache scopus-ai
 
-echo 'Pulling/pinning Qdrant and MariaDB images...'
+echo 'Building the language model server (llama.cpp) and pulling Qdrant and MariaDB...'
 docker pull qdrant/qdrant:v1.12.6
 docker pull mariadb:10.11.19
+./scripts/get_llama_server_source.sh
+docker compose build llm
 
 echo 'Starting stack...'
 docker compose up -d

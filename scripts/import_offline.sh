@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo 'Loading application image...'
+echo 'Loading application and language model server images...'
 docker load -i images/scopus-ai-gpu-1.1.tar
 
 echo 'Loading Qdrant image...'

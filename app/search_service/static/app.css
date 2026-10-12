@@ -166,7 +166,7 @@ a.ref-title:hover { text-decoration: underline; }
 .followup:disabled { opacity: .5; cursor: default; }
 
 .notice { border-radius: 12px; padding: 12px 16px; background: var(--surface-2); }
-.notice.blocked, .notice.error { background: var(--err-soft); }
+.notice.blocked, .notice.error, .notice.unavailable { background: var(--err-soft); }
 .notice.no_results, .notice.no_index { background: var(--warn-soft); }
 .notice.compact { font-size: 13.5px; padding: 8px 14px; margin-bottom: 12px; }
 

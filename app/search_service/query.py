@@ -1,8 +1,13 @@
 """
 Answering pipeline: hybrid retrieval (Qdrant vectors + BM25, RRF fusion,
-cross-encoder rerank), grounded generation with the local LLM, summary,
-citations and follow-up suggestions.  Reloads the index when the embedding
-service publishes a new one.
+cross-encoder rerank), grounded generation by the language model server
+(llm.py), summary, citations and follow-up suggestions.  Reloads the index
+when the embedding service publishes a new one.
+
+Answers contain only what the retrieved papers say: the model writes from
+numbered sources, and every sentence is checked against them before it is
+shown (grounding.py); unsupported sentences are dropped.  Up to LLM_PARALLEL
+questions are answered at the same time.
 """
 
 import os
@@ -11,33 +16,27 @@ import re
 import threading
 import time
 
-import numpy as np
-# torch must be imported before llama_cpp (via LlamaCPP below): llama.cpp links
-# the system NCCL, and loading it first breaks torch ("undefined symbol: ncclCommResume").
 import torch
-from sklearn.metrics.pairwise import cosine_similarity
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.llama_cpp import LlamaCPP
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from core.config import *
-from . import safety
+from core.index_meta import index_signature, read_index_meta
+from . import grounding, llm, safety
 from .filters import find_hard_keyword
 from .followup import standalone_question
 from .guard import check_question
-from core.index_meta import index_signature, read_index_meta
 
 
 # =====================================================
 # Global singletons
 # =====================================================
 
-_llm = None
 _embed_model = None
 _reranker = None
 
@@ -48,8 +47,11 @@ _bm25_corpus = None
 _index_signature = None
 
 _load_lock = threading.RLock()
-# One llama.cpp model instance: answer one question at a time.
-_answer_lock = threading.Lock()
+# The embedding model and reranker are shared by all questions; their
+# tokenizers must not be used by two threads at once.
+_model_lock = threading.Lock()
+# Questions answered at the same time (= parallel slots of the model server).
+_answer_slots = threading.BoundedSemaphore(LLM_PARALLEL)
 
 
 class IndexNotReady(RuntimeError):
@@ -76,6 +78,17 @@ NO_RESULTS_MESSAGE = (
     "🔍 No sufficiently relevant papers were found in the database for this question.\n\n"
     "This system only answers from the indexed literature. Try other keywords, a more "
     "specific research question, or check that the topic is covered by the indexed data."
+)
+
+NOT_IN_PAPERS_MESSAGE = (
+    "🔍 The papers found in the database do not answer this question.\n\n"
+    "This system only states what the indexed papers say. Try a more specific question "
+    "or other keywords."
+)
+
+LLM_DOWN_MESSAGE = (
+    "⚠️ The language model is not available right now. Please try again in a minute; "
+    "if this persists, ask an administrator to check the llm service."
 )
 
 
@@ -163,49 +176,10 @@ def get_embed_model():
         return _embed_model
 
 
-def get_llm():
-    global _llm
-
-    with _load_lock:
-        if _llm is None:
-            print("Loading LLM...")
-            print(
-                "LLM settings:",
-                f"ctx={LLM_CTX},",
-                f"batch={LLM_BATCH},",
-                f"new_tokens/call={LLM_MAX_NEW_TOKENS},",
-                f"gpu_layers={LLM_GPU_LAYERS}",
-            )
-
-            _llm = LlamaCPP(
-                model_path=LLM_PATH,
-                temperature=LLM_TEMPERATURE,
-                max_new_tokens=LLM_MAX_NEW_TOKENS,
-                context_window=LLM_CTX,
-                model_kwargs={
-                    "n_ctx": LLM_CTX,
-                    "n_batch": LLM_BATCH,
-                    "n_threads": LLM_THREADS,
-                    "n_gpu_layers": LLM_GPU_LAYERS,
-                    "repeat_penalty": LLM_REPEAT_PENALTY,
-                    "top_p": LLM_TOP_P,
-                    "top_k": LLM_TOP_K,
-                },
-                verbose=False,
-            )
-        return _llm
-
-
 def chat(messages, max_tokens=64, grammar=None, temperature=0.0) -> str:
-    """Short chat-formatted completion (uses the model's own chat template)."""
-    model = get_llm()._model
-    out = model.create_chat_completion(
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        grammar=grammar,
-    )
-    return (out["choices"][0]["message"].get("content") or "").strip()
+    """Short completion from the model server (question guard, follow-ups); no repeat penalty."""
+    return llm.chat(messages, max_tokens=max_tokens, temperature=temperature, grammar=grammar,
+                    repeat_penalty=1.0)[0]
 
 
 def get_reranker():
@@ -249,7 +223,33 @@ def get_retriever():
 
 
 def models_loaded() -> bool:
-    return _llm is not None and _reranker is not None and _embed_model is not None and safety.loaded()
+    return _reranker is not None and _embed_model is not None and safety.loaded()
+
+
+def load_models():
+    """
+    Load every model (at startup, or by the first question).  The safety
+    models come last, after the model server has loaded, so their automatic
+    GPU/CPU choice sees the real free GPU memory.
+    """
+    get_embed_model()
+    get_reranker()
+    if not llm.wait_until_ready(timeout=600):
+        print(f"⚠️ Language model server not ready at {LLM_URL}.")
+    safety.load()
+
+
+def preload():
+    """Background start-up: load the models and the index so the first question does not wait."""
+    try:
+        load_models()
+        get_bm25()
+        get_retriever()
+        print("Models and index loaded.")
+    except IndexNotReady as exc:
+        print(f"Models loaded; no search index yet ({exc}).")
+    except Exception as exc:
+        print(f"⚠️ Preloading failed ({exc}); the first question will try again.")
 
 
 def index_info() -> dict:
@@ -264,8 +264,6 @@ def index_info() -> dict:
             "sources": [s.get("name") for s in meta.get("sources") or []],
         }
     return {"ready": os.path.exists(BM25_PATH), "legacy": os.path.exists(BM25_PATH)}
-
-
 
 
 def build_reranker(top_n: int):
@@ -291,6 +289,13 @@ def build_reranker(top_n: int):
     return reranker
 
 
+def score_pairs(pairs):
+    """Cross-encoder scores (0..1) of (text, passage) pairs; used to check answer sentences."""
+    model = get_reranker()._model
+    with _model_lock:
+        return [float(s) for s in model.predict(pairs, show_progress_bar=False)]
+
+
 # =====================================================
 # Hybrid retrieval: Vector + BM25 + RRF + rerank
 # =====================================================
@@ -303,10 +308,11 @@ def hybrid_query(question, top_k=None):
     reranker = get_reranker()
 
     # 1. Vector retrieval, reranked to RERANK_TOP_N.
-    vector_nodes = reranker.postprocess_nodes(
-        retriever.retrieve(question),
-        query_str=question,
-    )
+    with _model_lock:
+        vector_nodes = reranker.postprocess_nodes(
+            retriever.retrieve(question),
+            query_str=question,
+        )
 
     # 2. BM25 retrieval
     bm25_index, bm25_docs = get_bm25()
@@ -362,323 +368,111 @@ def hybrid_query(question, top_k=None):
 
     # 4. Cross-encoder rerank (cached model; returns at most RERANK_TOP_N,
     #    scores 0..1)
-    reranked_nodes = reranker.postprocess_nodes(
-        nodes,
-        query_str=question,
-    )
+    with _model_lock:
+        reranked_nodes = reranker.postprocess_nodes(
+            nodes,
+            query_str=question,
+        )
 
     return reranked_nodes
 
 
 # =====================================================
-# Robust anti-truncation generation
+# Sources and references
 # =====================================================
-
-def _strip_model_prefixes(text: str) -> str:
-    text = text.strip()
-    text = re.sub(
-        r"^(answer|response|continuation|concise summary|summary)\s*:\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return text.strip()
-
-
-def _remove_end_marker(text: str) -> str:
-    return text.replace(END_MARKER, "").strip()
-
-
-def _visible(text: str) -> str:
-    """Text safe to show while streaming: no END_MARKER, not even half of one."""
-    text = _strip_model_prefixes(text.replace(END_MARKER, ""))
-    for size in range(len(END_MARKER) - 1, 0, -1):
-        if text.endswith(END_MARKER[:size]):
-            return text[:-size]
-    return text
-
-
-def _trim_incomplete_tail(text: str) -> str:
-    """Remove only an obviously unfinished final prose fragment."""
-    text = text.strip()
-
-    if not text:
-        return text
-
-    # Already looks complete.
-    if text.endswith((".", "!", "?", "```", ")", "]")):
-        return text
-
-    # Keep through the final sentence terminator.  This is a last-resort
-    # fallback used only when the model never returned END_MARKER.
-    last_positions = [text.rfind("."), text.rfind("!"), text.rfind("?")]
-    last = max(last_positions)
-
-    if last >= 0:
-        return text[: last + 1].strip()
-
-    return text
-
-
-def _merge_continuation(existing: str, continuation: str) -> str:
-    """Join continuation while removing a small repeated overlap if present."""
-    existing = existing.rstrip()
-    continuation = _strip_model_prefixes(continuation).lstrip()
-
-    if not existing:
-        return continuation
-    if not continuation:
-        return existing
-
-    # Character overlap guard for local models that repeat the end of the
-    # previous chunk.  Search a bounded overlap from longest to shortest.
-    max_overlap = min(500, len(existing), len(continuation))
-    for size in range(max_overlap, 39, -1):
-        if existing[-size:].strip() == continuation[:size].strip():
-            continuation = continuation[size:].lstrip()
-            break
-
-    if not continuation:
-        return existing
-
-    return existing + "\n" + continuation
-
-
-def _generate(prompt: str, on_partial=None) -> str:
-    """One bounded completion; streams the growing text to on_partial if given."""
-    llm = get_llm()
-    if on_partial is None:
-        return str(llm.complete(prompt)).strip()
-
-    text = ""
-    for part in llm.stream_complete(prompt):
-        text = part.text
-        on_partial(text)
-    return text.strip()
-
-
-def complete_without_truncation(
-    initial_prompt: str,
-    max_continuations: int = None,
-    on_text=None,
-) -> str:
-    """
-    Generate a response in bounded chunks until the model emits END_MARKER.
-
-    LLM_MAX_NEW_TOKENS therefore limits one generation call, not the final
-    displayed answer.  If the model still fails to finish after the allowed
-    continuation calls, an incomplete final prose fragment is removed.
-    on_text(visible_text) receives the answer while it is being generated.
-    """
-    if max_continuations is None:
-        max_continuations = LLM_MAX_CONTINUATIONS
-
-    def stream(prefix):
-        if on_text is None:
-            return None
-        return lambda partial: on_text(_visible((prefix + "\n" + partial) if prefix else partial))
-
-    first = _generate(initial_prompt, stream(""))
-    combined = _strip_model_prefixes(first)
-
-    if END_MARKER in combined:
-        return _remove_end_marker(combined)
-
-    for _ in range(max_continuations):
-        tail = combined[-CONTINUATION_TAIL_CHARS:]
-
-        continuation_prompt = f"""
-You are continuing an academic answer that may have been cut off by a generation limit.
-
-Rules:
-- If the answer below is already complete, output only {END_MARKER}.
-- Otherwise continue exactly from where it stopped.
-- Do not restart the answer.
-- Do not repeat earlier sentences or conclusions.
-- Finish the interrupted sentence first, then continue only as needed.
-- When the whole answer is complete, append {END_MARKER}.
-
-Recent end of the existing answer:
-{tail}
-
-Continuation:
-"""
-
-        continuation = _generate(continuation_prompt, stream(combined))
-
-        if not continuation:
-            break
-
-        combined = _merge_continuation(combined, continuation)
-
-        if END_MARKER in combined:
-            return _remove_end_marker(combined)
-
-    # Safety fallback: never display a visibly half-written final sentence.
-    return _trim_incomplete_tail(_remove_end_marker(combined))
-
-
-# =====================================================
-# Sentences and citations
-# =====================================================
-
-# Periods that do not end a sentence ("Smith et al. (2024) showed ...").
-_ABBREVIATIONS = (
-    "et al.", "e.g.", "i.e.", "etc.", "vs.", "cf.", "approx.",
-    "Fig.", "Figs.", "Eq.", "Ref.", "No.", "Vol.", "Dr.", "Prof.",
-)
-_DOT = "․"  # placeholder for protected periods
-
-
-def split_into_sentences(text: str, min_length: int = 0):
-    protected = text.strip()
-    for abbr in _ABBREVIATIONS:
-        protected = protected.replace(abbr, abbr.replace(".", _DOT))
-    protected = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", r"\1" + _DOT, protected)  # initials
-
-    sentences = re.split(r"(?<=[.!?])\s+", protected)
-    sentences = [s.replace(_DOT, ".").strip() for s in sentences]
-    return [s for s in sentences if len(s) > min_length]
-
-
-def keep_complete_sentences(text: str, max_sentences=None) -> str:
-    """Return only complete prose sentences, optionally limiting count."""
-    text = re.sub(r"\s+", " ", _remove_end_marker(text)).strip()
-    sentences = [s for s in split_into_sentences(text) if s.endswith((".", "!", "?"))]
-
-    if max_sentences is not None:
-        sentences = sentences[:max_sentences]
-
-    return " ".join(sentences)
-
 
 def _paper_key(metadata: dict) -> str:
     doi = (metadata.get("doi") or "").strip().lower()
     return doi or "title:" + (metadata.get("title") or "").strip().lower()
 
 
-def build_references(nodes):
-    """Distinct papers of the source chunks, numbered by relevance rank."""
-    references = []
-    seen = set()
+def _passage(text: str) -> str:
+    """Passage text without the repeated title/keyword lines added for search."""
+    seen, parts = set(), []
+    for part in re.split(r"\n\s*\n", text.strip()):
+        if part not in seen:
+            seen.add(part)
+            parts.append(part)
+    return "\n".join(parts)
+
+
+def build_sources(nodes):
+    """
+    The papers the answer is written from: numbered references (as shown to
+    the user) and the passages given to the model and to the sentence check.
+    """
+    references, sources, number_of = [], [], {}
     for item in nodes:
         md = item.node.metadata or {}
         key = _paper_key(md)
-        if key in seen:
-            continue
-        seen.add(key)
-        references.append({
-            "n": len(references) + 1,
-            "title": md.get("title") or "Unknown title",
-            "doi": md.get("doi") or "",
-            "year": md.get("year") or "",
-            "journal": md.get("journal") or "",
-            "source": md.get("source") or "",
-            "score": round(float(item.score or 0), 4),
-        })
-    return references
-
-
-def add_sentence_level_citations(answer_text: str, nodes, references) -> str:
-    """
-    Append [n] to sentences that are clearly supported by a source chunk;
-    n is the number of that paper in `references`.  Paragraphs and list items
-    of the answer are preserved.
-    """
-    if not nodes or not references:
-        return answer_text
-
-    number_of = {_paper_key(ref): ref["n"] for ref in references}
-
-    # Split into blocks/lines/sentences, remembering the layout.
-    blocks = []
-    for block in re.split(r"\n\s*\n", answer_text.strip()):
-        lines = [ln for ln in block.split("\n") if ln.strip()]
-        is_list = any(re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", ln) for ln in lines)
-        units = lines if is_list else [" ".join(ln.strip() for ln in lines)]
-        blocks.append((is_list, [split_into_sentences(u) for u in units]))
-
-    sentences = [s for _, units in blocks for unit in units for s in unit]
-    # Only real sentences get a citation, not headings like "Main methods include:".
-    candidates = [s for s in sentences if len(s) > 10 and s.rstrip("*_ ").endswith((".", "!", "?"))]
-    if not candidates:
-        return answer_text
-
-    embed_model = get_embed_model()
-    sent_embeds = np.array(embed_model.get_text_embedding_batch(candidates))
-    chunk_embeds = np.array(embed_model.get_text_embedding_batch([n.node.text for n in nodes]))
-    sim = cosine_similarity(sent_embeds, chunk_embeds)
-
-    cite_for = {}
-    for i, sentence in enumerate(candidates):
-        best = int(np.argmax(sim[i]))
-        if float(sim[i][best]) > 0.3:
-            n = number_of.get(_paper_key(nodes[best].node.metadata or {}))
-            if n:
-                cite_for[sentence] = n
-
-    def cite(sentence):
-        n = cite_for.get(sentence)
-        if not n:
-            return sentence
-        # Put the marker before the final punctuation: "... results [2]."
-        match = re.match(r"^(.*?)([.!?]+)$", sentence)
-        return f"{match.group(1)} [{n}]{match.group(2)}" if match else f"{sentence} [{n}]"
-
-    out_blocks = []
-    for is_list, units in blocks:
-        rendered = [" ".join(cite(s) for s in unit) for unit in units]
-        out_blocks.append("\n".join(rendered) if is_list else rendered[0])
-    return "\n\n".join(out_blocks)
+        if key not in number_of:
+            number_of[key] = len(references) + 1
+            references.append({
+                "n": number_of[key],
+                "title": md.get("title") or "Unknown title",
+                "doi": md.get("doi") or "",
+                "year": md.get("year") or "",
+                "journal": md.get("journal") or "",
+                "source": md.get("source") or "",
+                "score": round(float(item.score or 0), 4),
+            })
+        details = ", ".join(str(x) for x in (md.get("year"), md.get("journal")) if x)
+        header = (md.get("title") or "Untitled") + (f" ({details})" if details else "")
+        sources.append(grounding.Source(number_of[key], _passage(item.node.text), header))
+    return references, sources
 
 
 # =====================================================
-# Summary and follow-up suggestions
+# Grounded answer
 # =====================================================
 
-def generate_summary(full_answer: str) -> str:
-    prompt = f"""
-You are an academic editor.
+ANSWER_SYSTEM = (
+    "You write answers for an offline literature search engine. You write ONLY from the "
+    "numbered sources given with the question; they are abstracts of papers in the local "
+    "database.\n"
+    "Rules:\n"
+    "- State only facts that the sources contain. Do not add background knowledge, examples, "
+    "names, numbers or dates that are not in the sources.\n"
+    "- End every sentence with the number of the source that supports it, like [2] or [1][3].\n"
+    "- If the sources contain no information that answers the question, reply with exactly: "
+    "NO_ANSWER\n"
+    "- If they answer only part of the question, answer that part and say that the sources do "
+    "not cover the rest.\n"
+    "- Cover the relevant findings of every source that addresses the question, in two to four "
+    "paragraphs (or a list), in the language of the question. Do not repeat yourself."
+)
 
-Create a short summary of the answer below.
+SUMMARY_SYSTEM = (
+    "You summarize an answer of a literature search engine in two to four sentences. Use only "
+    "statements from the answer, keep their source numbers like [2], and add nothing new."
+)
 
-STRICT RULES:
-- Write 3 to {SUMMARY_MAX_SENTENCES} complete sentences.
-- Use no more than about {SUMMARY_MAX_WORDS} words.
-- Put the most important conclusion first.
-- Keep only the most important findings.
-- Do not repeat an idea, phrase, or conclusion.
-- Do not use bullet points.
-- Do not add references or citations.
-- Never stop in the middle of a sentence.
-- After the final complete sentence, append {END_MARKER}.
 
-Answer to summarize:
-{full_answer}
+def _answer_messages(question, sources):
+    blocks = [f"[{s.n}] {s.header}\n{s.text}" for s in sources]
+    return [
+        {"role": "system", "content": ANSWER_SYSTEM},
+        {"role": "user", "content": "Sources:\n\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}"},
+    ]
 
-Concise summary:
-"""
 
+class _NoAnswer(Exception):
+    """The model said the sources do not answer the question."""
+
+
+def generate_summary(answer_text, verifier):
+    """Short summary of the (checked) answer; its sentences are checked as well."""
     try:
-        result = complete_without_truncation(
-            prompt,
-            max_continuations=SUMMARY_MAX_CONTINUATIONS,
-        )
-
-        clean = keep_complete_sentences(
-            result,
-            max_sentences=SUMMARY_MAX_SENTENCES,
-        )
-
-        if clean:
-            return clean
-
-    except Exception as exc:
+        text, _ = llm.chat(
+            [{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": answer_text}],
+            max_tokens=SUMMARY_MAX_TOKENS, temperature=LLM_TEMPERATURE)
+        summary = verifier.render(text, final=True) if GROUNDING else text.strip()
+        if summary:
+            return summary
+    except llm.LLMUnavailable as exc:
         print("Summary generation error:", exc)
-
-    # Deterministic fallback: only complete sentences.
-    sents = split_into_sentences(full_answer, min_length=10)
-    return " ".join(sents[:3])
+    # Fallback: the first two sentences of the checked answer.
+    return " ".join(grounding.split_sentences(re.sub(r"\s+", " ", answer_text))[:2])
 
 
 def suggest_followups(question: str, summary: str):
@@ -699,7 +493,7 @@ def suggest_followups(question: str, summary: str):
     ]
     try:
         text = chat(messages, max_tokens=120, temperature=0.2)
-    except Exception as exc:
+    except llm.LLMUnavailable as exc:
         print(f"Follow-up suggestions failed: {exc}")
         return []
 
@@ -719,64 +513,40 @@ def suggest_followups(question: str, summary: str):
 # Main RAG response
 # =====================================================
 
-ANSWER_PROMPT = """
-You are an academic research assistant.
-
-Answer the following question using ONLY the provided sources.
-
-Rules:
-- Be factual and academically precise.
-- Do not invent information that is absent from the sources.
-- Do not repeat the same idea or conclusion.
-- Use coherent paragraphs and complete sentences.
-- Be concise but sufficiently detailed to answer the question.
-- If the available sources do not support a requested point, say so.
-- Never stop in the middle of a sentence.
-- When the entire answer is complete, append {end_marker}.
-
-Question:
-{question}
-
-Sources:
-{context}
-
-Answer:
-"""
-
-
 def answer_question(question: str, history=None, progress=None) -> dict:
     """
     Answer one question (optionally a follow-up in a conversation).
 
     progress(event, **data) receives "stage" events (stage, text) and "delta"
-    events (text = the answer written so far).  Returns a dict with
-    status = answered | blocked | no_results | no_index | empty.
+    events (text = the checked answer written so far).  Returns a dict with
+    status = answered | blocked | no_results | no_index | unavailable | empty.
     """
     emit = progress or (lambda event, **data: None)
     question = (question or "").strip()
     if not question:
         return _final({"status": "empty", "message": "⚠️ Please enter a non-empty academic question."})
 
-    if not _answer_lock.acquire(blocking=False):
-        emit("stage", stage="queued", text="Waiting for the previous question to finish…")
-        _answer_lock.acquire()
+    if not _answer_slots.acquire(blocking=False):
+        emit("stage", stage="queued", text="Waiting for a free answer slot…")
+        _answer_slots.acquire()
     try:
         return _answer(question, history, emit)
+    except llm.LLMUnavailable as exc:
+        print(f"Language model unavailable: {exc}")
+        return _final({"question": question, "status": "unavailable", "message": LLM_DOWN_MESSAGE})
     finally:
-        _answer_lock.release()
+        _answer_slots.release()
 
 
 def _answer(question, history, emit):
-    timings = {}
     started = time.time()
 
     def stage(name, text):
-        timings[name] = time.time()
         emit("stage", stage=name, text=text)
 
     if not models_loaded():
         stage("loading", "Loading models (first question only)…")
-        get_llm(), get_embed_model(), get_reranker(), safety.load()
+        load_models()
 
     stage("check", "Checking the question…")
     standalone = standalone_question(question, history, chat)
@@ -807,30 +577,38 @@ def _answer(question, history, emit):
     if top_score < RELEVANCE_WARN_SCORE:
         base["notice"] = LOW_RELEVANCE_NOTE
 
-    nodes = [n for n in nodes if float(n.score or 0) >= SOURCE_MIN_SCORE] or nodes[:1]
-    context = "\n\n".join(n.node.text for n in nodes[:4])
+    # The same papers are given to the model, checked against and listed.
+    nodes = ([n for n in nodes if float(n.score or 0) >= SOURCE_MIN_SCORE] or nodes[:1])[:ANSWER_SOURCES]
+    references, sources = build_sources(nodes)
+    verifier = grounding.AnswerVerifier(sources, score_pairs, standalone)
 
     stage("answer", "Writing the answer…")
-    # The safety model checks the answer while it is written; only checked
-    # text is shown, and an unsafe answer is stopped.
+    # The safety model checks the text while it is written; of the checked
+    # text only sentences supported by the sources are shown.
     monitor = safety.output_monitor(standalone)
     last_emit = [0.0]
 
-    def on_text(text):
+    def on_text(raw):
+        if raw.lstrip().startswith("NO_ANSWER"):
+            raise _NoAnswer()
+        text = raw
         if monitor:
-            monitor.update(text)  # raises safety.UnsafeOutput to stop the answer
-            text = monitor.verified(text)
+            monitor.update(raw)  # raises safety.UnsafeOutput to stop the answer
+            text = monitor.verified(raw)
+        if GROUNDING:
+            text = verifier.render(text)
         now = time.time()
         if now - last_emit[0] >= 0.15:
             last_emit[0] = now
             emit("delta", text=text)
 
+    raw, finish, verdict = "", None, None
     try:
-        answer_text = complete_without_truncation(
-            ANSWER_PROMPT.format(end_marker=END_MARKER, question=standalone, context=context),
-            on_text=on_text,
-        )
-        verdict = monitor.finish(answer_text) if monitor else None
+        raw, finish = llm.chat(_answer_messages(standalone, sources), max_tokens=LLM_ANSWER_TOKENS,
+                               temperature=LLM_TEMPERATURE, on_text=on_text)
+        verdict = monitor.finish(raw) if monitor else None
+    except _NoAnswer:
+        raw = "NO_ANSWER"
     except safety.UnsafeOutput as exc:
         verdict = exc.verdict
     finally:
@@ -838,14 +616,19 @@ def _answer(question, history, emit):
             monitor.close()
     if verdict and verdict.blocked:
         return _unsafe_answer(base, verdict)
-    emit("delta", text=answer_text)
+
+    raw = raw.replace("NO_ANSWER", "").strip()
+    # A reply cut off by the token limit ends with an unfinished sentence: drop it.
+    answer = verifier.render(raw, final=finish != "length") if GROUNDING else raw
+    base["grounding"] = {"checked": len(verifier.verdicts), "removed": len(verifier.removed)}
+    for sentence, reason in verifier.removed:
+        print(f"Grounding: dropped ({reason}): {sentence[:160]!r}")
+    if not answer or (GROUNDING and not verifier.supported_claims()):
+        return _final({**base, "status": "no_results", "message": NOT_IN_PAPERS_MESSAGE})
+    emit("delta", text=answer)
 
     stage("summary", "Summarizing…")
-    summary = generate_summary(answer_text)
-
-    stage("cite", "Adding citations…")
-    references = build_references(nodes)
-    cited_answer = add_sentence_level_citations(answer_text, nodes, references)
+    summary = generate_summary(answer, verifier)
 
     followups = []
     if SUGGEST_FOLLOWUPS:
@@ -860,7 +643,7 @@ def _answer(question, history, emit):
         **base,
         "status": "answered",
         "summary": summary,
-        "answer": cited_answer,
+        "answer": answer,
         "references": references,
         "followups": followups,
         "seconds": round(time.time() - started, 1),

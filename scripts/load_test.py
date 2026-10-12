@@ -412,47 +412,66 @@ def scenario_sustained(clients, args, gpu, probe):
 # Capacity estimate
 # =====================================================
 
-def mva(service_s, think_s, users):
-    """Mean response time of `users` users sharing one server (exact MVA, delay station)."""
+def mva(service_s, think_s, users, floor=0.0):
+    """
+    Mean response time of `users` users sharing one server (exact MVA, delay
+    station).  floor: no answer is faster than one user's answer.
+    """
     queue = 0.0
     response = service_s
     for n in range(1, users + 1):
         response = service_s * (1 + queue)
         throughput = n / (response + think_s)
         queue = throughput * response
-    return response
+    return max(response, floor)
 
 
-def max_users(service_s, think_s, target_s):
+def max_users(service_s, think_s, target_s, floor=0.0):
     n = 1
-    while n < 10000 and mva(service_s, think_s, n + 1) <= target_s:
+    while n < 10000 and mva(service_s, think_s, n + 1, floor) <= target_s:
         n += 1
-    return n if mva(service_s, think_s, n) <= target_s else 0
+    return n if mva(service_s, think_s, n, floor) <= target_s else 0
 
 
 def estimate(data, fast_share):
     """
-    Capacity from the time per question.  Two values when the multi-user tests
-    ran: the one-user baseline (fewer questions) and the time measured during
-    the multi-user tests (more questions, more varied answer lengths); each
-    figure is then a range [conservative, optimistic].
+    Capacity from the time per question.
+
+    One slot (LLM_PARALLEL=1): answers are written one after another, so the
+    time per answer is the service time; two values when the multi-user tests
+    ran (one-user baseline and the multi-user tests), giving ranges.
+    Several slots: answers overlap, so the time per answer is the effective
+    time with all slots busy (largest burst: duration / answers).
     """
     b = data.get("baseline") or {}
     s_r, s_f = b.get("service_research_s"), b.get("service_fast_s") or 0
     if not s_r:
         return {}
-    loaded = [service_s(r) for run in data.get("burst", []) + ([data["sustained"]] if "sustained" in data else [])
-              for r in run["results"] if r["kind"] == "research" and not r["error"]]
-    times = {"one_user_s": (1 - fast_share) * s_r + fast_share * s_f}
-    if len(loaded) >= 5:
-        times["multi_user_s"] = (1 - fast_share) * mean(loaded) + fast_share * s_f
+    mix = lambda s: (1 - fast_share) * s + fast_share * s_f
+    parallel = data["meta"].get("parallel", 1)
+    one_user = mix(s_r)
+    times = {}
+    if parallel > 1:
+        full = [run for run in data.get("burst", []) if run["users"] >= 2 * parallel]
+        if full:
+            run = max(full, key=lambda x: x["users"])
+            done = [r for r in run["results"] if not r["error"]]
+            times["full_load_s"] = mix(run["seconds"] / max(1, len(done)))
+        else:
+            times["one_user_s"] = one_user          # no full-load data: conservative
+    else:
+        loaded = [service_s(r) for run in data.get("burst", []) + ([data["sustained"]] if "sustained" in data else [])
+                  for r in run["results"] if r["kind"] == "research" and not r["error"]]
+        times["one_user_s"] = one_user
+        if len(loaded) >= 5:
+            times["multi_user_s"] = mix(mean(loaded))
     slow, quick = max(times.values()), min(times.values())
     return {
-        **times, "fast_share": fast_share,
+        **times, "answer_s": one_user, "parallel": parallel, "fast_share": fast_share,
         "answers_per_hour": [3600 / slow, 3600 / quick],
         "at_once_within_60s": [int(60 // slow), int(60 // quick)],
         "at_once_within_120s": [int(120 // slow), int(120 // quick)],
-        "users": {f"think{z}_target{t}": [max_users(slow, z, t), max_users(quick, z, t)]
+        "users": {f"think{z}_target{t}": [max_users(slow, z, t, one_user), max_users(quick, z, t, one_user)]
                   for z in THINK_TIMES for t in TARGETS},
     }
 
@@ -529,16 +548,24 @@ def report_md(data):
             f"{x['answer_chars_max']} characters, {fmt(x['service_max_s'])} s of server time.")
         e = data.get("estimate") or {}
         if e:
-            preds = [mva(e[k], s["think_s"], s["users"]) for k in ("multi_user_s", "one_user_s") if k in e]
+            preds = [mva(e[k], s["think_s"], s["users"], e.get("answer_s", 0))
+                     for k in ("multi_user_s", "one_user_s", "full_load_s") if k in e]
             add(f"The estimate below predicts a mean response of {span(preds, 1)} s for this load.\n")
 
     e = data.get("estimate")
     if e:
-        times = [e[k] for k in ("multi_user_s", "one_user_s") if k in e]
+        times = [e[k] for k in ("multi_user_s", "one_user_s", "full_load_s") if k in e]
+        parallel = e.get("parallel", 1)
         add("## Estimated capacity\n")
-        add(f"One language model answers one question at a time: {span(times, 1)} s per question "
-            f"({int(e['fast_share'] * 100)} % refused quickly) = about "
-            f"**{span(e['answers_per_hour'])} answers per hour**.")
+        if parallel > 1 and "full_load_s" in e:
+            add(f"The language model server writes {parallel} answers at the same time. With all slots "
+                f"busy one answer is finished every {span(times, 1)} s ({int(e['fast_share'] * 100)} % "
+                f"refused quickly) = about **{span(e['answers_per_hour'])} answers per hour**; a single "
+                f"answer takes {e['answer_s']:.1f} s.")
+        else:
+            add(f"The language model answers {'one question' if parallel == 1 else f'{parallel} questions'} "
+                f"at a time: {span(times, 1)} s per question ({int(e['fast_share'] * 100)} % refused "
+                f"quickly) = about **{span(e['answers_per_hour'])} answers per hour**.")
         if len(times) > 1:
             add("Ranges: the first value uses the time per question measured in the multi-user tests "
                 "(more questions, more varied answers), the second the one-user test.")
@@ -562,15 +589,17 @@ def compare(paths):
             continue
         d = json.load(open(f))
         b, e, m = d.get("baseline") or {}, d.get("estimate") or {}, d["meta"]
-        rows.append((m.get("settings") or "from .env", b.get("service_research_s"),
+        gpu_max = max([(b.get("gpu") or {}).get("vram_max_mib") or 0]
+                      + [(run.get("gpu") or {}).get("vram_max_mib") or 0 for run in d.get("burst", [])])
+        rows.append((m.get("settings") or "from .env", m.get("parallel", 1), b.get("service_research_s"),
                      (b.get("research") or {}).get("ttft_p50_s"), b.get("writing_speed_cps"),
-                     (b.get("gpu") or {}).get("vram_max_mib"), e.get("answers_per_hour") or [None],
+                     gpu_max or None, e.get("answers_per_hour") or [None],
                      (e.get("users") or {}).get("think120_target60") or [None]))
-    print("| Settings | Research answer (s) | First text (s) | Writing speed (chars/s) | "
+    print("| Settings | Slots | Research answer (s) | First text (s) | Writing speed (chars/s) | "
           "GPU memory (MiB) | Answers/hour | Users (think 120 s, mean ≤ 60 s) |")
-    print("|---|---|---|---|---|---|---|")
-    for settings, s, ttft, speed, vram, per_hour, users in rows:
-        print(f"| {settings} | {fmt(s)} | {fmt(ttft)} | {fmt(speed, 0)} | {fmt(vram, 0)} | "
+    print("|---|---|---|---|---|---|---|---|")
+    for settings, parallel, s, ttft, speed, vram, per_hour, users in rows:
+        print(f"| {settings} | {parallel} | {fmt(s)} | {fmt(ttft)} | {fmt(speed, 0)} | {fmt(vram, 0)} | "
               f"{span(per_hour)} | {span(users)} |")
 
 
@@ -592,6 +621,7 @@ def main():
     ap.add_argument("--fast-share", type=float, default=0.1, help="share of refused questions in the estimate")
     ap.add_argument("--label", default="default")
     ap.add_argument("--settings", default="")
+    ap.add_argument("--parallel", type=int, default=1, help="LLM_PARALLEL of the model server")
     ap.add_argument("--out", default=None)
     ap.add_argument("--compare", nargs="+", metavar="DIR", help="print a table of earlier runs and exit")
     ap.add_argument("--rebuild", nargs="+", metavar="DIR", help="recompute the reports of earlier runs and exit")
@@ -619,7 +649,7 @@ def main():
     probe_client, clients = clients[0], clients[1:]
 
     gpu = GpuSampler()
-    meta = {"label": args.label, "settings": args.settings, "url": args.url,
+    meta = {"label": args.label, "settings": args.settings, "url": args.url, "parallel": args.parallel,
             "date": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
         name = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],

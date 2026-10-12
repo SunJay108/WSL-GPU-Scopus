@@ -82,6 +82,9 @@ def connect():
     conn = sqlite3.connect(HISTORY_DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL mode: commits without waiting for the disk each time; the database
+    # stays consistent, a power cut can only lose the last transactions.
+    conn.execute("PRAGMA synchronous = NORMAL")
     try:
         with conn:
             yield conn

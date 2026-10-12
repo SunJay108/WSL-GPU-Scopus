@@ -124,8 +124,9 @@ TOPIC_QUESTIONS = {
                 "medicine, biology or computer security?",
 }
 
-_GRAMMAR = None
-_YES_NO = None
+# GBNF grammars (llama.cpp) that restrict the model's reply.
+CATEGORY_GRAMMAR = "root ::= " + " | ".join(f'"{c}"' for c in CATEGORIES)
+YES_NO_GRAMMAR = 'root ::= "YES" | "NO"'
 
 
 @dataclass
@@ -143,32 +144,12 @@ def _blocked(category, reason):
     return GuardDecision(False, category, reason, MESSAGES[category])
 
 
-def _grammar():
-    """Constrain the model's reply to one of the category names."""
-    global _GRAMMAR
-    if _GRAMMAR is None:
-        from llama_cpp import LlamaGrammar
-
-        rule = " | ".join(f'"{c}"' for c in CATEGORIES)
-        _GRAMMAR = LlamaGrammar.from_string(f"root ::= {rule}", verbose=False)
-    return _GRAMMAR
-
-
-def yes_no_grammar():
-    global _YES_NO
-    if _YES_NO is None:
-        from llama_cpp import LlamaGrammar
-
-        _YES_NO = LlamaGrammar.from_string('root ::= "YES" | "NO"', verbose=False)
-    return _YES_NO
-
-
 def is_about_topic(question, topic, chat) -> bool:
     messages = [
         {"role": "system", "content": "Answer YES or NO."},
         {"role": "user", "content": f"{TOPIC_QUESTIONS[topic]}\nQuestion: {question}"},
     ]
-    return chat(messages, max_tokens=2, grammar=yes_no_grammar()).strip().upper() == "YES"
+    return chat(messages, max_tokens=2, grammar=YES_NO_GRAMMAR).strip().upper() == "YES"
 
 
 def classify(question, chat):
@@ -179,7 +160,7 @@ def classify(question, chat):
         messages.append({"role": "assistant", "content": label})
     messages.append({"role": "user", "content": question})
 
-    reply = chat(messages, max_tokens=6, grammar=_grammar()).strip().upper()
+    reply = chat(messages, max_tokens=6, grammar=CATEGORY_GRAMMAR).strip().upper()
     return reply if reply in CATEGORIES else "RESEARCH"
 
 

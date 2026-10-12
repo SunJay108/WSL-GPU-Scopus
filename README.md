@@ -3,21 +3,22 @@
 Offline Scopus AI / RAG system: hybrid retrieval (BM25 + Qdrant vectors + RRF fusion),
 BGE reranking and Qwen GGUF answer generation on an NVIDIA GPU.
 
-It runs as two web services that share one search index:
+It runs as two web services that share one search index, plus a language model server:
 
 | Service | URL | Purpose |
 |---|---|---|
 | **Embedding service** (`scopus-embedding`) | http://localhost:7861 | Select the folder with the MySQL data, press **Start ingest**, watch progress, get an alert when it is done |
 | **Scopus search UI** (`scopus-ai`) | http://localhost:7860 | Chat with history: ask research questions and follow-ups; answers cite the indexed papers |
+| **Language model server** (`llm`) | internal | llama.cpp server: one copy of the model, `LLM_PARALLEL` answers at the same time |
 
 ```text
  MySQL data folder (.frm/.MYD/.MYI)                                  Browser
             │                                                        │      │
             ▼                                                   :7861│      │:7860
- ┌────────────────────┐  stage + SQL  ┌─────────┐        ┌───────────▼──┐ ┌─▼──────────┐
- │ scopus-embedding   │──────────────▶│ mariadb │        │  embedding   │ │ scopus-ai  │
- │ (FastAPI + UI)     │◀──────────────│ (intern)│        │  UI          │ │ (chat UI)  │
- └─────────┬──────────┘     rows      └─────────┘        └──────────────┘ └─────┬──────┘
+ ┌────────────────────┐  stage + SQL  ┌─────────┐        ┌───────────▼──┐ ┌─▼──────────┐   ┌───────┐
+ │ scopus-embedding   │──────────────▶│ mariadb │        │  embedding   │ │ scopus-ai  │──▶│  llm  │
+ │ (FastAPI + UI)     │◀──────────────│ (intern)│        │  UI          │ │ (chat UI)  │◀──│(slots)│
+ └─────────┬──────────┘     rows      └─────────┘        └──────────────┘ └─────┬──────┘   └───────┘
            │ vectors (new collection, then alias swap)                          │ search
            ▼                                                                    ▼
       ┌─────────┐   alias "papers"  ◀─────────────────────────────────────────────
@@ -27,7 +28,8 @@ It runs as two web services that share one search index:
 
 - The build happens on an **online** PC; the result is copied to a **fully offline** PC.
 - Docker Engine in WSL2 (Docker Desktop not required), NVIDIA Container Toolkit, NVIDIA Windows driver.
-- Images: `scopus-ai-gpu:1.1` (both app services), `qdrant/qdrant:v1.12.6`, `mariadb:10.11.19`.
+- Images: `scopus-ai-gpu:1.1` (both app services), `scopus-llm:b10991` (llama.cpp server, built from
+  `Dockerfile.llm` on top of the app image), `qdrant/qdrant:v1.12.6`, `mariadb:10.11.19`.
 - Models are mounted from `./models`, the index from `./app/data` and `./qdrant_data`.
 
 ## 1. Project layout
@@ -44,7 +46,9 @@ It runs as two web services that share one search index:
 │   │   └── index_meta.py       description of the live index (written by ingest, read by search)
 │   ├── search_service/         Scopus search UI (port 7860)
 │   │   ├── server.py           REST API: chat, history, admin panel
-│   │   ├── query.py            hybrid retrieval + generation; reloads the index after an ingest
+│   │   ├── query.py            hybrid retrieval + grounded answer; reloads the index after an ingest
+│   │   ├── llm.py              client of the language model server (service llm)
+│   │   ├── grounding.py        checks every answer sentence against the source papers
 │   │   ├── followup.py         turns follow-up questions into standalone search questions
 │   │   ├── guard.py            decides which questions are answered (Scopus-AI-style)
 │   │   ├── safety.py           Qwen3Guard safety models: question check, answer check while streaming
@@ -70,6 +74,8 @@ It runs as two web services that share one search index:
 ├── .env / .env.example
 ├── Dockerfile                  full image build
 ├── Dockerfile.upgrade          quick 1.0 → 1.1 image upgrade
+├── Dockerfile.llm              language model server (llama.cpp llama-server) on the app image
+├── third_party/                llama.cpp source archive for Dockerfile.llm (downloaded, not in git)
 ├── docker-compose.yml
 └── requirements.txt
 ```
@@ -138,8 +144,9 @@ chmod +x scripts/*.sh
 ./scripts/build_online.sh
 ```
 
-This builds `scopus-ai-gpu:1.1` (llama-cpp-python compiled with CUDA), pulls Qdrant and MariaDB,
-and starts all four containers.
+This builds `scopus-ai-gpu:1.1`, downloads the llama.cpp source and builds the language model server
+`scopus-llm` on top of it (about 30 minutes; CUDA kernels for RTX 20xx/30xx/40xx), pulls Qdrant and
+MariaDB, and starts all five containers.
 
 If `scopus-ai-gpu:1.0` already exists, `./scripts/upgrade_image.sh` is much faster: it builds 1.1 on
 top of 1.0 (`Dockerfile.upgrade`: adds PyMySQL and recompiles llama.cpp for RTX 20xx–40xx GPUs),
@@ -255,22 +262,54 @@ The safety models use the GPU when they fit next to the other models (`SAFETY_*_
 the CPU. On a 6 GB GPU the answer check runs on the GPU and the question check on the CPU; together they
 add about 0.8 s per answer (10.3 s instead of 9.5 s) and 0.5 s per refused question.
 
+### Answers only from the indexed papers
+
+The language model may only restate what the retrieved papers say (`app/search_service/grounding.py`):
+
+1. **Sources in, citations out.** The model receives the top `ANSWER_SOURCES` papers (title, year, journal,
+   abstract) as numbered sources and is told to use nothing else, to cite a source after every sentence and
+   to reply `NO_ANSWER` when the sources do not answer the question. Decoding is greedy
+   (`LLM_TEMPERATURE=0`). The references under the answer are exactly these papers.
+2. **Every sentence is checked before it is shown**, while the answer streams:
+   - the cross-encoder of the search scores the sentence against each source; the best score must reach
+     `GROUNDING_MIN_SCORE`;
+   - every number (results, years, sample sizes) must occur in the sources;
+   - every name, acronym or capitalised term ("ResNet", "LSTM", "Smith et al.") must occur in the sources.
+
+   Sentences that fail are not shown (they are logged: `docker logs scopus-ai-gpu | grep Grounding`, and
+   counted in the admin panel). Sentences that only say what the sources do not cover are kept. The
+   citation `[n]` of every kept sentence points to the source that supports it best.
+3. **The summary is checked the same way**; it is written from the checked answer only.
+4. **No supported sentence → no answer.** If nothing survives the check, or the model replies `NO_ANSWER`,
+   the user gets "The papers found in the database do not answer this question" instead of an answer.
+
+Measured on 12 research questions: 56 of 57 sentences of real answers passed the check (the one dropped
+was an unsupported generalisation), and 0 of 96 fabricated sentences passed — invented numbers and names,
+off-topic facts, and plausible general knowledge that the papers do not state ("deep learning needs large
+labelled datasets", "further research is needed"). In the end-to-end test, hallucinated sentences injected
+into the model's reply never reached the screen, and a reply with nothing supported became "the papers do
+not answer this question".
+
+Limit: the support score measures whether a passage backs a sentence, not strict logical entailment, so a
+sentence that rewords a paper's finding inaccurately but stays on its subject can still pass. Raise
+`GROUNDING_MIN_SCORE` for stricter answers (more sentences are dropped) or lower it for fuller answers.
+
 ## 8. GPU settings
 
 `.env`:
 
 ```text
-LLM_CTX=4096
-LLM_BATCH=256
-LLM_THREADS=4
-LLM_GPU_LAYERS=-1        # -1 = all layers on the GPU; lower it (20, 15, …) if VRAM is short
+LLM_MODEL=qwen2.5-3b-instruct-q4_k_m.gguf   # model file in ./models (any GGUF instruct model)
+LLM_PARALLEL=1           # answers written at the same time (server slots)
+LLM_CTX=4096             # context per answer: sources + question + answer
+LLM_GPU_LAYERS=all       # all model layers on the GPU; a number (20, 15, …) if VRAM is short
 EMBED_BATCH_SIZE=128     # embedding batch; halved automatically on CUDA out-of-memory
 EMBED_FP16=true          # half-precision ingest embeddings (~4x faster, same retrieval results)
 ```
 
-On small GPUs (6 GB) the search UI (LLM + embedding + reranker + answer safety model ≈ 4.5 GB) and an
-ingest share VRAM.
-Both keep working, but for the fastest ingest stop the search UI while it runs:
+GPU memory on a 6 GB card: Windows ≈ 0.6 GB, language model server ≈ 2.2 GB (3B model, one slot),
+search UI ≈ 2 GB (embedding model, reranker, answer safety model; the question safety model runs on the
+CPU). An ingest shares the GPU too; both keep working, but for the fastest ingest stop the search UI:
 
 ```bash
 docker compose stop scopus-ai
@@ -281,60 +320,74 @@ docker compose start scopus-ai
 Each ingest runs in its own worker process, so all GPU memory used for embedding is released when
 the job ends.
 
+### Scaling to a larger GPU
+
+The parts that limit the number of users are separated so each can grow with the GPU:
+
+| Part | How it scales |
+|---|---|
+| Language model (`llm`) | llama.cpp server: one copy of the weights, `LLM_PARALLEL` slots decoded together (continuous batching). More GPU memory → more slots → more answers at the same time. A faster GPU writes each answer faster. |
+| Model size | `LLM_MODEL` can point to a larger GGUF model (e.g. a 7B or 14B instruct model) for better answers; the grounding check still keeps only supported sentences. |
+| Search UI | Answer streams are asynchronous (no thread per waiting user); up to `LLM_PARALLEL` questions are processed at once, the rest wait in arrival order. |
+| Safety models | Put on the GPU automatically when they fit (`SAFETY_*_DEVICE=auto`), on the CPU otherwise. |
+| Retrieval | Qdrant + BM25 + reranker take about 1 s per question and are not the bottleneck. |
+
+To use a larger GPU: set `LLM_PARALLEL` (memory per slot: about 150 MB for this 3B model at
+`LLM_CTX=4096`, more for larger models), run `docker compose up -d`, then measure with
+`./scripts/load_test.sh -e LLM_PARALLEL=4` and compare runs with `--compare`.
+
 ### How many users? (load test)
 
 ```bash
 ./scripts/load_test.sh                                         # full test, about 20 minutes
-./scripts/load_test.sh -e LLM_GPU_LAYERS=20 -- --scenarios baseline   # other settings, a few minutes
+./scripts/load_test.sh -e LLM_PARALLEL=4 -- --scenarios baseline,burst   # other settings, a few minutes
 python3 scripts/load_test.py --compare loadtest_results/*      # table of all runs
 ```
 
 The test starts a throwaway copy of the search service with its own empty database (real accounts and
-chats are not touched). The search page is offline while it runs, because a 6 GB GPU has room for one
-copy of the models. Reports are written to `loadtest_results/<run>/report.md`.
+chats are not touched). The search page is offline while it runs (GPU memory). `LLM_*` settings restart
+the language model server with them for the test. Reports are written to `loadtest_results/<run>/report.md`.
 
-The search service has one language model and answers **one question at a time**; others wait in
-arrival order. Capacity therefore depends on the time per question. Reference results (RTX 2060
-6 GB, 127,883 papers, measured before the safety models were added; with them each answer takes
-about 8 % longer, see the last table):
+The language model server writes `LLM_PARALLEL` answers at the same time; further questions wait in
+arrival order. Reference results (RTX 2060 6 GB, 127,883 papers, one slot, safety models and sentence
+check on):
 
 | | Result |
 |---|---|
-| One research question | 9.3 s (first text after 2.4 s); refused question 0.8 s |
-| Time per stage | check 0.4 s, search 1.2 s, answer 4.5 s, summary 1.7 s, citations 0.1 s, follow-up suggestions 1.0 s |
-| Throughput | 356–425 answers per hour |
-| 16 users asking at the same moment | all answered after 200 s (median 86 s); no errors |
-| 10 users asking every ~60 s for 7 min | mean response 41.7 s, p95 89 s (estimate: 32–46 s) |
-| 48 users waiting at once | the rest of the site stayed responsive (chat list max 2.6 s) |
-| GPU | 5.0 of 6.1 GB, 68–80 % busy, max 80 °C, speed constant under load |
+| One research question | 8.0 s (first text after 2.9 s); refused question 1.1 s |
+| Time per stage | check 0.8 s, search 1.0 s, answer 2.7 s, summary 1.1 s, follow-up suggestions 1.3 s |
+| Throughput | 490–585 answers per hour |
+| 16 users asking at the same moment | all answered after 115 s (median 57 s); no errors |
+| 10 users asking every ~60 s for 6 min | mean response 13.5 s, p95 25.6 s |
+| 48 users waiting at once | the rest of the site stayed responsive (chat list max 1.3 s) |
+| GPU | 5.1 of 6.1 GB, 42–55 % busy, max 71 °C |
 
 Estimated number of users who keep asking (think time = time spent reading between questions):
 
 | Think time | Mean response ≤ 30 s | Mean response ≤ 60 s |
 |---|---|---|
-| 60 s | 7–9 users | 11–14 users |
-| 120 s | 11–14 users | 17–20 users |
-| 300 s | 23–30 users | 32–39 users |
+| 60 s | 11–13 users | 16–19 users |
+| 120 s | 17–22 users | 24–28 users |
+| 300 s | 36–45 users | 46–56 users |
 
 Logged-in users who are idle or reading old chats cost nothing; only questions use the GPU.
 
-Effect of the GPU settings (one user; users = think time 120 s, mean response ≤ 60 s):
+Parallel slots on the same RTX 2060 (users = think time 120 s, mean response ≤ 60 s):
 
-| Settings | Research answer | GPU memory | Users |
+| `LLM_PARALLEL` | 8 users at once: answers/min | Wait of the 2nd of 2 users | Users |
 |---|---|---|---|
-| All on the GPU, safety models on (default) | 10.3 s | 5.7 GB | 18 |
-| `SAFETY_INPUT=false SAFETY_OUTPUT=false` | 9.5 s | 4.6 GB | 20 |
-| `EMBED_DEVICE=cpu RERANK_DEVICE=cpu` | 18.7 s | 3.2 GB | 9 |
-| `LLM_GPU_LAYERS=20` (of 36) | 36.1 s | 4.3 GB | 3 |
-| `LLM_GPU_LAYERS=0 LLM_THREADS=8` (CPU) | 71.9 s | 3.3 GB | 0 |
+| 1 | 10.1 | 6.0 s | 24–28 |
+| 2 | 11.6 | 0.4 s | 37 |
+| 4 | 12.8 | 0.4 s | 41 |
 
-(The last three rows were measured without the safety models and with fp32 embedding/reranker.)
+On this GPU the gain from more slots is small: most GPU time goes to reading the prompts (the sources,
+about 1,500 tokens per answer, at about 900 tokens/s), which is compute-bound. A faster GPU reads and
+writes several times faster and runs more slots, so capacity grows with both; measure it there with
+`./scripts/load_test.sh -e LLM_PARALLEL=N`.
 
-Keep everything on the GPU whenever it fits. `SUGGEST_FOLLOWUPS=false` saves the 1.0 s follow-up
-stage (about 10 % more capacity). Rarely the model writes a very long answer (one in the test had
-19,600 characters and took 70 s), and everyone waits behind it; a lower `LLM_MAX_CONTINUATIONS`
-(default 6) caps that. A faster GPU raises capacity roughly in proportion to its writing speed
-("Writing speed" in `--compare`); run the test on the target PC for its own numbers.
+Keep everything on the GPU whenever it fits (an earlier test with the language model on the CPU took
+72 s per answer instead of 9 s). `SUGGEST_FOLLOWUPS=false` saves the follow-up stage (about 15 % more
+capacity). `LLM_ANSWER_TOKENS` caps the longest answer (default 900 tokens).
 
 ## 9. Verify GPU acceleration
 
@@ -350,15 +403,19 @@ Expected: `llama_supports_gpu_offload = True` and `torch.cuda.is_available = Tru
 docker compose ps
 docker logs -f scopus-embedding     # ingest progress is printed here too
 docker logs -f scopus-ai-gpu
+docker logs -f scopus-llm           # language model server
 docker logs -f scopus-qdrant
 docker logs -f scopus-mariadb
+curl -s http://localhost:7860/api/health   # search UI ready? (models, language model server, index)
 ```
 
 | Symptom | Fix |
 |---|---|
 | UI chip "MariaDB unreachable" right after start | MariaDB initialises its data directory on first start; wait ~20 s |
 | "No search index is available yet" in the search UI | Run an ingest in the embedding UI |
+| "The language model is not available right now" | `docker ps` should show `scopus-llm (healthy)`; `docker logs scopus-llm` shows model loading or GPU memory errors (lower `LLM_PARALLEL` or `LLM_CTX`) |
 | A research question is refused | `docker logs scopus-ai-gpu \| grep Guard:` shows why; adjust `app/search_service/filters.py`, or lower `RELEVANCE_MIN_SCORE` for "no relevant papers" |
+| "The papers found in the database do not answer this question" | The model found nothing in the sources, or no sentence passed the check; `docker logs scopus-ai-gpu \| grep Grounding` lists dropped sentences |
 | Embedding shows "on cpu" | GPU not visible in the container (`./scripts/verify_gpu.sh`) or `EMBED_DEVICE=cpu` |
 | Embedding UI not reachable from another PC | Set `EMBED_SERVICE_BIND=0.0.0.0` in `.env`, then `docker compose up -d` |
 | Data folder on a Windows drive | Set `IMPORT_DIR=/mnt/d/your/folder` in `.env`, then `docker compose up -d` |
@@ -404,7 +461,7 @@ Everything needed at runtime (models, tokenizer data, UI assets, fonts) is local
 
 ## 13. Notes
 
-1. Build and validate the CUDA image online first; do not compile `llama-cpp-python` on the offline PC.
+1. Build and validate the CUDA images online first; do not build `scopus-llm` on the offline PC.
 2. Keep `qdrant_data` and `app/data/storage` together when transferring a prebuilt index.
 3. An index built by the old `ingest.py` keeps working; the first **Replace** ingest converts it to the
    alias layout (the old `papers` collection is replaced).
