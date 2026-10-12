@@ -114,6 +114,18 @@ services:
       RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
       RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}
       SUGGEST_FOLLOWUPS: ${SUGGEST_FOLLOWUPS:-true}
+      SEARCH_FP16: ${SEARCH_FP16:-true}
+
+      # Safety models (Qwen3Guard; see app/search_service/safety.py)
+      SAFETY_INPUT: ${SAFETY_INPUT:-true}
+      SAFETY_INPUT_MODEL_PATH: /app/models/Qwen3Guard-Gen-0.6B
+      SAFETY_INPUT_DEVICE: ${SAFETY_INPUT_DEVICE:-auto}
+      SAFETY_INPUT_CONTROVERSIAL: ${SAFETY_INPUT_CONTROVERSIAL:-Political,Jailbreak}
+      SAFETY_OUTPUT: ${SAFETY_OUTPUT:-true}
+      SAFETY_OUTPUT_MODEL_PATH: /app/models/Qwen3Guard-Stream-0.6B
+      SAFETY_OUTPUT_DEVICE: ${SAFETY_OUTPUT_DEVICE:-auto}
+      SAFETY_OUTPUT_CONTROVERSIAL: ${SAFETY_OUTPUT_CONTROVERSIAL:-}
+      SAFETY_OUTPUT_MIN_TOKENS: ${SAFETY_OUTPUT_MIN_TOKENS:-2}
 
     volumes:
       # IMPORTANT: bind-mount the whole app directory so Python/UI changes

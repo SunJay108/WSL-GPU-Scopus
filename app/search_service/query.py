@@ -26,6 +26,7 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from core.config import *
+from . import safety
 from .filters import find_hard_keyword
 from .followup import standalone_question
 from .guard import check_question
@@ -64,6 +65,11 @@ NO_INDEX_MESSAGE = (
 LOW_RELEVANCE_NOTE = (
     "⚠️ Only loosely related papers were found in the database, so this answer may not "
     "address your question directly."
+)
+
+UNSAFE_ANSWER_MESSAGE = (
+    "⛔ The answer was stopped because it may contain unsafe content.\n\n"
+    "Please rephrase the question or ask about another research topic."
 )
 
 NO_RESULTS_MESSAGE = (
@@ -151,6 +157,9 @@ def get_embed_model():
                 model_name=EMBED_MODEL_PATH,
                 device=embed_device,
             )
+            if embed_device.startswith("cuda") and SEARCH_FP16:
+                _embed_model._model.half()
+                torch.cuda.empty_cache()  # give the freed fp32 copy back (room for the safety models)
         return _embed_model
 
 
@@ -240,7 +249,7 @@ def get_retriever():
 
 
 def models_loaded() -> bool:
-    return _llm is not None and _reranker is not None and _embed_model is not None
+    return _llm is not None and _reranker is not None and _embed_model is not None and safety.loaded()
 
 
 def index_info() -> dict:
@@ -264,7 +273,7 @@ def build_reranker(top_n: int):
     device = resolve_device(RERANK_DEVICE)
 
     try:
-        return SentenceTransformerRerank(
+        reranker = SentenceTransformerRerank(
             model=RERANKER_PATH,
             top_n=top_n,
             device=device,
@@ -272,10 +281,14 @@ def build_reranker(top_n: int):
     except TypeError:
         # Some llama-index versions do not expose `device` here.  In that
         # case sentence-transformers will select the available device itself.
-        return SentenceTransformerRerank(
+        reranker = SentenceTransformerRerank(
             model=RERANKER_PATH,
             top_n=top_n,
         )
+    if device.startswith("cuda") and SEARCH_FP16:
+        reranker._model.model.half()
+        torch.cuda.empty_cache()
+    return reranker
 
 
 # =====================================================
@@ -763,7 +776,7 @@ def _answer(question, history, emit):
 
     if not models_loaded():
         stage("loading", "Loading models (first question only)…")
-        get_llm(), get_embed_model(), get_reranker()
+        get_llm(), get_embed_model(), get_reranker(), safety.load()
 
     stage("check", "Checking the question…")
     standalone = standalone_question(question, history, chat)
@@ -798,18 +811,33 @@ def _answer(question, history, emit):
     context = "\n\n".join(n.node.text for n in nodes[:4])
 
     stage("answer", "Writing the answer…")
+    # The safety model checks the answer while it is written; only checked
+    # text is shown, and an unsafe answer is stopped.
+    monitor = safety.output_monitor(standalone)
     last_emit = [0.0]
 
     def on_text(text):
+        if monitor:
+            monitor.update(text)  # raises safety.UnsafeOutput to stop the answer
+            text = monitor.verified(text)
         now = time.time()
         if now - last_emit[0] >= 0.15:
             last_emit[0] = now
             emit("delta", text=text)
 
-    answer_text = complete_without_truncation(
-        ANSWER_PROMPT.format(end_marker=END_MARKER, question=standalone, context=context),
-        on_text=on_text,
-    )
+    try:
+        answer_text = complete_without_truncation(
+            ANSWER_PROMPT.format(end_marker=END_MARKER, question=standalone, context=context),
+            on_text=on_text,
+        )
+        verdict = monitor.finish(answer_text) if monitor else None
+    except safety.UnsafeOutput as exc:
+        verdict = exc.verdict
+    finally:
+        if monitor:
+            monitor.close()
+    if verdict and verdict.blocked:
+        return _unsafe_answer(base, verdict)
     emit("delta", text=answer_text)
 
     stage("summary", "Summarizing…")
@@ -823,6 +851,10 @@ def _answer(question, history, emit):
     if SUGGEST_FOLLOWUPS:
         stage("followups", "Suggesting follow-up questions…")
         followups = suggest_followups(standalone, summary)
+
+    verdict = safety.check_output(standalone, "\n".join([summary] + followups))
+    if verdict and verdict.blocked:
+        return _unsafe_answer(base, verdict)
 
     return _final({
         **base,
@@ -862,6 +894,16 @@ def format_markdown(result: dict) -> str:
     if result.get("followups"):
         md += "---\n## 🔎 Related questions\n\n" + "".join(f"- {q}\n" for q in result["followups"])
     return md
+
+
+def _unsafe_answer(base, verdict):
+    print(f"Answer stopped by the safety check: {verdict.reason}")
+    return _final({
+        **base,
+        "status": "blocked",
+        "guard": {"category": verdict.guard_category, "reason": f"answer check: {verdict.reason}"},
+        "message": UNSAFE_ANSWER_MESSAGE,
+    })
 
 
 def _final(result: dict) -> dict:

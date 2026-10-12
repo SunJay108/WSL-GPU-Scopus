@@ -553,16 +553,20 @@ Papers whose DOI is already indexed are skipped.
 Your v1.2 system can use:
 
 ```text
-multilingual-e5-small → CUDA GPU (search + embedding service, fp16 during ingest)
+multilingual-e5-small → CUDA GPU (search + embedding service, fp16)
 Qwen2.5 GGUF          → CUDA GPU
-BGE reranker          → GPU where supported
+BGE reranker          → CUDA GPU (fp16)
+Qwen3Guard-Stream     → GPU if it fits (answer safety check), else CPU
+Qwen3Guard-Gen        → GPU if it fits (question safety check), else CPU
 Qdrant                → CPU
 BM25                  → CPU
 MariaDB               → CPU (only during an ingest)
 ```
 
-On a 6 GB GPU the search UI (LLM + embedding + reranker ≈ 5 GB) and an ingest share the
-GPU memory. Both work, but an ingest is about 1.5x faster with the search UI stopped:
+On a 6 GB GPU the search UI uses about 4.5 GB (LLM + embedding + reranker + answer safety
+model; the question safety model runs on the CPU). `docker logs scopus-ai-gpu | grep -i safety`
+shows where each safety model was loaded. The search UI and an ingest share the GPU memory.
+Both work, but an ingest is about 1.5x faster with the search UI stopped:
 
 ```bash
 docker stop scopus-ai-gpu       # before a large ingest

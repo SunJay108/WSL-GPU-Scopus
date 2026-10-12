@@ -47,6 +47,7 @@ It runs as two web services that share one search index:
 │   │   ├── query.py            hybrid retrieval + generation; reloads the index after an ingest
 │   │   ├── followup.py         turns follow-up questions into standalone search questions
 │   │   ├── guard.py            decides which questions are answered (Scopus-AI-style)
+│   │   ├── safety.py           Qwen3Guard safety models: question check, answer check while streaming
 │   │   ├── filters.py          keyword lists used by the guard
 │   │   ├── history.py          chat history (own chats; deleted chats kept for admins)
 │   │   └── static/             chat UI and admin panel (no external resources; works offline)
@@ -64,7 +65,8 @@ It runs as two web services that share one search index:
 │       └── history/            chat_history.sqlite3
 ├── models/
 ├── qdrant_data/
-├── scripts/                    build, upgrade, export/import offline bundle, ingest, GPU check, load test
+├── scripts/                    build, upgrade, export/import offline bundle, ingest, GPU check, load test,
+│                               safety model download
 ├── .env / .env.example
 ├── Dockerfile                  full image build
 ├── Dockerfile.upgrade          quick 1.0 → 1.1 image upgrade
@@ -85,9 +87,13 @@ your data folders below `IMPORT_DIR`, and `cp .env.example .env`.
 models/
 ├── multilingual-e5-small/
 ├── bge-reranker-base/
-└── qwen2.5-3b-instruct-q4_k_m.gguf
+├── qwen2.5-3b-instruct-q4_k_m.gguf
+├── Qwen3Guard-Gen-0.6B/        question safety check
+└── Qwen3Guard-Stream-0.6B/     answer safety check
 ```
 
+Download the two Qwen3Guard models (Apache-2.0, about 1.5 GB each) on the online PC with
+`./scripts/download_safety_models.sh`; without them the safety checks are skipped.
 Nothing is downloaded at runtime (Hugging Face offline mode is enforced in `docker-compose.yml`).
 
 ## 3. Input data
@@ -232,13 +238,22 @@ words:
 | Step | What happens |
 |---|---|
 | 1. Hard keywords | Names and phrases in `HARD_BLOCK_KEYWORDS` (`app/search_service/filters.py`), e.g. political leaders, extremist groups, conspiracy slogans, are always refused. Spelling variants are caught (`xijinping`, `Xi-Jinping`, full-width letters). Asking what a religious group thinks ("what do Muslims think about it?") is refused too. |
-| 2. Language model | The local model classifies the question: research → answered; restricted topic (politics, war/military, religion, ideology, conspiracy), personal information about a person, harmful requests, off-topic chat → a short explanation instead. |
-| 3. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. For a follow-up, both the message as typed and the rewritten question are checked. |
-| 4. Relevance | If the best paper scores below `RELEVANCE_MIN_SCORE` the answer is "no relevant papers" instead of an answer from unrelated sources; below `RELEVANCE_WARN_SCORE` the answer carries a "loosely related papers" notice. |
+| 2. Safety model (question) | **Qwen3Guard-Gen-0.6B** (`app/search_service/safety.py`) rates the question Safe / Controversial / Unsafe: violence, illegal acts, sexual content, self-harm, personal data, unethical acts, copyright, jailbreak attempts and politics. Unsafe is refused; Controversial only for Political and Jailbreak (`SAFETY_INPUT_CONTROVERSIAL`). Research questions on sensitive subjects (suicide prevention, opioid epidemiology, explosive detection) pass. |
+| 3. Language model | The local model classifies the question: research → answered; restricted topic (politics, war/military, religion, ideology, conspiracy), personal information about a person, harmful requests, off-topic chat → a short explanation instead. |
+| 4. Topic check | Words in `TOPIC_KEYWORDS` that also have research meanings ("support vector machine", "heart attack", "nuclear magnetic resonance", "air pollution in China") only block if the model confirms the question is really about that topic. For a follow-up, both the message as typed and the rewritten question are checked. |
+| 5. Relevance | If the best paper scores below `RELEVANCE_MIN_SCORE` the answer is "no relevant papers" instead of an answer from unrelated sources; below `RELEVANCE_WARN_SCORE` the answer carries a "loosely related papers" notice. |
+| 6. Safety model (answer) | **Qwen3Guard-Stream-0.6B** checks the answer token by token while it is written. The page shows only text that has been checked (about one sentence behind), and an answer judged Unsafe is stopped and replaced by a notice. The summary and suggested questions are checked too. |
 
-`docker logs scopus-ai-gpu` shows each decision, e.g. `Guard: RESTRICTED (keyword 'xi jinping')`.
+Steps 2 and 3 run at the same time. `docker logs scopus-ai-gpu` shows each decision, e.g.
+`Guard: RESTRICTED (keyword 'xi jinping')`, `Guard: HARMFUL (safety model: Unsafe (Violent))` or
+`Answer stopped by the safety check: Unsafe (Violent)`; the admin panel shows the same reason.
 Edit the lists in `app/search_service/filters.py` and restart the container to change the policy; `GUARD_MODE=keywords`
-in `.env` switches back to plain keyword blocking.
+in `.env` switches back to plain keyword blocking, `SAFETY_INPUT=false` / `SAFETY_OUTPUT=false` turn the safety
+models off.
+
+The safety models use the GPU when they fit next to the other models (`SAFETY_*_DEVICE=auto`), otherwise
+the CPU. On a 6 GB GPU the answer check runs on the GPU and the question check on the CPU; together they
+add about 0.8 s per answer (10.3 s instead of 9.5 s) and 0.5 s per refused question.
 
 ## 8. GPU settings
 
@@ -253,7 +268,8 @@ EMBED_BATCH_SIZE=128     # embedding batch; halved automatically on CUDA out-of-
 EMBED_FP16=true          # half-precision ingest embeddings (~4x faster, same retrieval results)
 ```
 
-On small GPUs (6 GB) the search UI (LLM + embedding + reranker ≈ 5 GB) and an ingest share VRAM.
+On small GPUs (6 GB) the search UI (LLM + embedding + reranker + answer safety model ≈ 4.5 GB) and an
+ingest share VRAM.
 Both keep working, but for the fastest ingest stop the search UI while it runs:
 
 ```bash
@@ -279,7 +295,8 @@ copy of the models. Reports are written to `loadtest_results/<run>/report.md`.
 
 The search service has one language model and answers **one question at a time**; others wait in
 arrival order. Capacity therefore depends on the time per question. Reference results (RTX 2060
-6 GB, 127,883 papers):
+6 GB, 127,883 papers, measured before the safety models were added; with them each answer takes
+about 8 % longer, see the last table):
 
 | | Result |
 |---|---|
@@ -305,10 +322,13 @@ Effect of the GPU settings (one user; users = think time 120 s, mean response �
 
 | Settings | Research answer | GPU memory | Users |
 |---|---|---|---|
-| All on the GPU (default) | 9.3 s | 5.0 GB | 17–20 |
+| All on the GPU, safety models on (default) | 10.3 s | 5.7 GB | 18 |
+| `SAFETY_INPUT=false SAFETY_OUTPUT=false` | 9.5 s | 4.6 GB | 20 |
 | `EMBED_DEVICE=cpu RERANK_DEVICE=cpu` | 18.7 s | 3.2 GB | 9 |
 | `LLM_GPU_LAYERS=20` (of 36) | 36.1 s | 4.3 GB | 3 |
 | `LLM_GPU_LAYERS=0 LLM_THREADS=8` (CPU) | 71.9 s | 3.3 GB | 0 |
+
+(The last three rows were measured without the safety models and with fp32 embedding/reranker.)
 
 Keep everything on the GPU whenever it fits. `SUGGEST_FOLLOWUPS=false` saves the 1.0 s follow-up
 stage (about 10 % more capacity). Rarely the model writes a very long answer (one in the test had

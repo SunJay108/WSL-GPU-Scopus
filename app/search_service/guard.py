@@ -6,7 +6,10 @@ about rather than which words it contains:
 
 1. Keywords in filters.HARD_BLOCK_KEYWORDS, and asking what a religious group
    thinks or believes, are always refused.
-2. The local language model classifies the question:
+2. The safety model Qwen3Guard-Gen (safety.py) refuses unsafe questions:
+   violence, illegal acts, sexual content, self-harm, personal data,
+   unethical acts, copyright, jailbreak attempts, and political topics.
+3. The local language model classifies the question:
      RESEARCH    answered
      RESTRICTED  politics, war/military, religion, ideology, conspiracy
      PERSONAL    personal details about an individual
@@ -16,16 +19,19 @@ about rather than which words it contains:
    (filters.TOPIC_KEYWORDS, e.g. "attack", "policy", "China", "Muslim"), the
    model answers one narrow yes/no question for that topic as well.  Such
    words are therefore allowed in genuine research questions only.
-3. If the model is unavailable (or GUARD_MODE=keywords), every keyword of
+4. If the model is unavailable (or GUARD_MODE=keywords), every keyword of
    both lists in filters.py blocks.
 
 After retrieval, query.py also declines questions for which the database
-holds no sufficiently relevant papers.
+holds no sufficiently relevant papers, and Qwen3Guard-Stream checks the
+answer while it is written.
 """
 
+import threading
 from dataclasses import asdict, dataclass
 
 from core.config import GUARD_MODE
+from . import safety
 from .filters import TOPIC_OF_KEYWORD, find_hard_keyword, find_topic_keywords
 
 
@@ -41,6 +47,16 @@ MESSAGES = {
         "It does not provide personal information about individuals."
     ),
     "HARMFUL": "⛔ This system cannot help with requests that could cause harm.",
+    # From the safety model only (safety.GUARD_CATEGORY).
+    "SELF_HARM": (
+        "💙 If you are thinking about harming yourself, please talk to someone you trust "
+        "or contact a local crisis line or emergency number now.\n\n"
+        "This system only answers research questions from the paper database."
+    ),
+    "JAILBREAK": (
+        "⛔ This system only answers research questions from the paper database; "
+        "its instructions cannot be changed."
+    ),
     "OFF_TOPIC": (
         "👋 I answer research questions using the papers in the local database.\n\n"
         "Try asking, for example:\n"
@@ -181,6 +197,28 @@ def check_question(question, chat=None, standalone=None):
         if keyword:
             return _blocked("RESTRICTED", f"keyword {keyword!r}")
 
+    # The safety model (possibly on the CPU) runs while the language model
+    # classifies; its refusal takes precedence.  A follow-up is judged in its
+    # rewritten form, which keeps every content word of the message.
+    found = {}
+    worker = threading.Thread(target=_safety_check, args=(texts[-1], found), daemon=True)
+    worker.start()
+    decision = _topic_decision(texts, chat)
+    worker.join()
+    verdict = found.get("verdict")
+    if verdict and verdict.blocked:
+        return _blocked(verdict.guard_category, f"safety model: {verdict.reason}")
+    return decision
+
+
+def _safety_check(text, found):
+    try:
+        found["verdict"] = safety.check_input(text)
+    except Exception as exc:
+        print(f"⚠️ Question safety model failed ({exc}); continuing without it.")
+
+
+def _topic_decision(texts, chat):
     keywords_of = {text: find_topic_keywords(text) for text in texts}
     topic_keywords = list(dict.fromkeys(kw for kws in keywords_of.values() for kw in kws))
 

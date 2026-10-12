@@ -136,6 +136,38 @@ GUARD_MODE = os.getenv("GUARD_MODE", "llm").strip().lower()
 HISTORY_TURNS = _clamp(_env_int("HISTORY_TURNS", 3), 0, 10)
 SUGGEST_FOLLOWUPS = _env_bool("SUGGEST_FOLLOWUPS", True)
 
+# Half precision for the embedding model and reranker of the search service on
+# CUDA: about 0.8 GB less GPU memory, same ranking (room for the safety models).
+SEARCH_FP16 = _env_bool("SEARCH_FP16", True)
+
+
+# =====================================================
+# Search service: safety models (Qwen3Guard, search_service/safety.py)
+# =====================================================
+
+def _env_list(name: str, default: str):
+    return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
+
+# Qwen3Guard-Gen judges each question; Qwen3Guard-Stream checks the answer
+# while it is written.  A missing model folder turns that check off.  Devices:
+# auto = the GPU if the model fits next to the other models, else the CPU.
+SAFETY_INPUT = _env_bool("SAFETY_INPUT", True)
+SAFETY_INPUT_MODEL_PATH = os.getenv("SAFETY_INPUT_MODEL_PATH", "/app/models/Qwen3Guard-Gen-0.6B")
+SAFETY_INPUT_DEVICE = os.getenv("SAFETY_INPUT_DEVICE", "auto").strip().lower()
+SAFETY_OUTPUT = _env_bool("SAFETY_OUTPUT", True)
+SAFETY_OUTPUT_MODEL_PATH = os.getenv("SAFETY_OUTPUT_MODEL_PATH", "/app/models/Qwen3Guard-Stream-0.6B")
+SAFETY_OUTPUT_DEVICE = os.getenv("SAFETY_OUTPUT_DEVICE", "auto").strip().lower()
+
+# "Unsafe" is always refused.  "Controversial" only in these categories
+# (Violent, Sexual Content, Self-Harm, Political, PII, Copyright, Illegal Acts,
+# Unethical, Jailbreak).
+SAFETY_INPUT_CONTROVERSIAL = _env_list("SAFETY_INPUT_CONTROVERSIAL", "Political,Jailbreak")
+SAFETY_OUTPUT_CONTROVERSIAL = _env_list("SAFETY_OUTPUT_CONTROVERSIAL", "")
+# An answer is stopped after this many answer tokens in a row are judged unsafe
+# (1 = the first one; higher values ignore single-token false alarms).
+SAFETY_OUTPUT_MIN_TOKENS = _clamp(_env_int("SAFETY_OUTPUT_MIN_TOKENS", 2), 1, 20)
+
 
 # =====================================================
 # Embedding service

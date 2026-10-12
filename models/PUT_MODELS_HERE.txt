@@ -4,5 +4,8 @@ models/
   multilingual-e5-small/
   bge-reranker-base/
   qwen2.5-3b-instruct-q4_k_m.gguf
+  Qwen3Guard-Gen-0.6B/        question safety check  (./scripts/download_safety_models.sh)
+  Qwen3Guard-Stream-0.6B/     answer safety check    (./scripts/download_safety_models.sh)
 
 The application is designed to run with local files only at runtime.
+Without the two Qwen3Guard folders the safety checks are skipped.
