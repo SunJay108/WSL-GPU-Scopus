@@ -64,7 +64,7 @@ It runs as two web services that share one search index:
 │       └── history/            chat_history.sqlite3
 ├── models/
 ├── qdrant_data/
-├── scripts/                    build, upgrade, export/import offline bundle, ingest, GPU check
+├── scripts/                    build, upgrade, export/import offline bundle, ingest, GPU check, load test
 ├── .env / .env.example
 ├── Dockerfile                  full image build
 ├── Dockerfile.upgrade          quick 1.0 → 1.1 image upgrade
@@ -264,6 +264,57 @@ docker compose start scopus-ai
 
 Each ingest runs in its own worker process, so all GPU memory used for embedding is released when
 the job ends.
+
+### How many users? (load test)
+
+```bash
+./scripts/load_test.sh                                         # full test, about 20 minutes
+./scripts/load_test.sh -e LLM_GPU_LAYERS=20 -- --scenarios baseline   # other settings, a few minutes
+python3 scripts/load_test.py --compare loadtest_results/*      # table of all runs
+```
+
+The test starts a throwaway copy of the search service with its own empty database (real accounts and
+chats are not touched). The search page is offline while it runs, because a 6 GB GPU has room for one
+copy of the models. Reports are written to `loadtest_results/<run>/report.md`.
+
+The search service has one language model and answers **one question at a time**; others wait in
+arrival order. Capacity therefore depends on the time per question. Reference results (RTX 2060
+6 GB, 127,883 papers):
+
+| | Result |
+|---|---|
+| One research question | 9.3 s (first text after 2.4 s); refused question 0.8 s |
+| Time per stage | check 0.4 s, search 1.2 s, answer 4.5 s, summary 1.7 s, citations 0.1 s, follow-up suggestions 1.0 s |
+| Throughput | 356–425 answers per hour |
+| 16 users asking at the same moment | all answered after 200 s (median 86 s); no errors |
+| 10 users asking every ~60 s for 7 min | mean response 41.7 s, p95 89 s (estimate: 32–46 s) |
+| 48 users waiting at once | the rest of the site stayed responsive (chat list max 2.6 s) |
+| GPU | 5.0 of 6.1 GB, 68–80 % busy, max 80 °C, speed constant under load |
+
+Estimated number of users who keep asking (think time = time spent reading between questions):
+
+| Think time | Mean response ≤ 30 s | Mean response ≤ 60 s |
+|---|---|---|
+| 60 s | 7–9 users | 11–14 users |
+| 120 s | 11–14 users | 17–20 users |
+| 300 s | 23–30 users | 32–39 users |
+
+Logged-in users who are idle or reading old chats cost nothing; only questions use the GPU.
+
+Effect of the GPU settings (one user; users = think time 120 s, mean response ≤ 60 s):
+
+| Settings | Research answer | GPU memory | Users |
+|---|---|---|---|
+| All on the GPU (default) | 9.3 s | 5.0 GB | 17–20 |
+| `EMBED_DEVICE=cpu RERANK_DEVICE=cpu` | 18.7 s | 3.2 GB | 9 |
+| `LLM_GPU_LAYERS=20` (of 36) | 36.1 s | 4.3 GB | 3 |
+| `LLM_GPU_LAYERS=0 LLM_THREADS=8` (CPU) | 71.9 s | 3.3 GB | 0 |
+
+Keep everything on the GPU whenever it fits. `SUGGEST_FOLLOWUPS=false` saves the 1.0 s follow-up
+stage (about 10 % more capacity). Rarely the model writes a very long answer (one in the test had
+19,600 characters and took 70 s), and everyone waits behind it; a lower `LLM_MAX_CONTINUATIONS`
+(default 6) caps that. A faster GPU raises capacity roughly in proportion to its writing speed
+("Writing speed" in `--compare`); run the test on the target PC for its own numbers.
 
 ## 9. Verify GPU acceleration
 

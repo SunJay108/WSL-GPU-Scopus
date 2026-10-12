@@ -730,6 +730,17 @@ run an ingest with **Add to index**.
 
 If both work, your system is truly offline.
 
+To find out how many users this PC's GPU can serve, run the load test (about 20 minutes; the search
+page is offline meanwhile, real accounts and chats are not touched):
+
+```bash
+cd ~/Scopus
+./scripts/load_test.sh
+cat loadtest_results/*/report.md
+```
+
+See "How many users? (load test)" in `README.md` for the reference results of an RTX 2060.
+
 ---
 
 # 25. Offline troubleshooting

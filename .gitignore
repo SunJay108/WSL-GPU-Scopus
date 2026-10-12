@@ -31,3 +31,6 @@ __pycache__/
 *Zone.Identifier
 Thumbs.db
 desktop.ini
+
+# Load test results (scripts/load_test.sh)
+loadtest_results/
