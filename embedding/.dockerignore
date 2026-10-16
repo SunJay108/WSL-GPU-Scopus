@@ -1,0 +1,7 @@
+models
+data
+scripts
+images
+**/__pycache__
+*.md
+.env

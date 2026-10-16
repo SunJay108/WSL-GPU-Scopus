@@ -1,0 +1,98 @@
+# Scopus AI embedding service: builds the search index on its own PC and
+# exports it as a bundle for the search app.  Nothing here is shared with
+# the search app (own Qdrant, own accounts, own data folders).
+#
+# Services
+#   qdrant     vector database holding the index          (internal only)
+#   mariadb    reads the MySQL MyISAM files during an ingest (internal only)
+#   embedding  web UI + ingest + export                    http://localhost:7861
+
+name: scopus-embedding
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: embed-qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+      # Snapshots are written into the export folder (see the embedding
+      # service's volumes); the temporary file is created next to it, so the
+      # finished snapshot is moved, not copied.
+      QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/snapshots
+      QDRANT__STORAGE__TEMP_PATH: /qdrant/snapshots/.tmp
+    # RocksDB keeps many files open; the default soft limit (1024) makes Qdrant
+    # panic with "Too many open files" while an ingest builds a second collection.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+      - ${EXPORT_DIR:-./data/exports}/.snapshots:/qdrant/snapshots
+
+  mariadb:
+    image: mariadb:10.11.19
+    container_name: embed-mariadb
+    restart: unless-stopped
+    # Table files copied from a running MySQL server are marked "not closed
+    # properly"; the default recovery then checks the whole index (minutes per
+    # GB on a hard disk) although the ingest only reads the rows once.  A table
+    # that really is damaged is still repaired when reading it fails.
+    command: ["--myisam-recover-options=OFF"]
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-scopus-staging}
+    volumes:
+      # Shared with the embedding service, which copies table files into it.
+      - mariadb_data:/var/lib/mysql
+
+  embedding:
+    image: scopus-embedding:1.0
+    build:
+      context: .
+    container_name: embed-service
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+      - mariadb
+    ports:
+      # Localhost only by default. Set EMBED_SERVICE_BIND=0.0.0.0 in .env to
+      # allow other PCs on the network.
+      - "${EMBED_SERVICE_BIND:-127.0.0.1}:${EMBED_SERVICE_PORT:-7861}:7861"
+    gpus: all
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-300}
+      QDRANT_COLLECTION: papers
+      EMBED_MODEL_PATH: /app/models/multilingual-e5-small
+      EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
+      EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-128}
+      EMBED_FP16: ${EMBED_FP16:-true}
+      INGEST_BATCH: ${INGEST_BATCH:-1000}
+      QUALITY_SAMPLE: ${QUALITY_SAMPLE:-100}
+      # Fully offline: never try to reach Hugging Face.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-false}
+      SESSION_DAYS: ${SESSION_DAYS:-7}
+      # Host paths, shown in the UI
+      IMPORT_HOST_DIR: ${IMPORT_DIR:-./data/import}
+      EXPORT_HOST_DIR: ${EXPORT_DIR:-./data/exports}
+      MARIADB_HOST: mariadb
+      MARIADB_PASSWORD: ${MARIADB_ROOT_PASSWORD:-scopus-staging}
+      MARIADB_DATADIR: /mariadb_data
+    volumes:
+      # Code is bind-mounted: changes take effect without rebuilding the image.
+      - ./app:/app/app
+      - ./models:/app/models:ro
+      # Data folders the UI can browse (and upload into).
+      - ${IMPORT_DIR:-./data/import}:/import
+      # Export bundles for the search app (and Qdrant's snapshots, below it).
+      - ${EXPORT_DIR:-./data/exports}:/exports
+      # Accounts, activity log, job state, index description.
+      - ./data/state:/state
+      - mariadb_data:/mariadb_data
+      - /etc/localtime:/etc/localtime:ro   # show local times instead of UTC
+
+volumes:
+  mariadb_data:

@@ -1,0 +1,12 @@
+Put the embedding model here (the same model the search app uses):
+
+  models/multilingual-e5-small/      intfloat/multilingual-e5-small
+      config.json, model.safetensors, tokenizer.json, tokenizer_config.json,
+      sentencepiece.bpe.model, special_tokens_map.json, modules.json,
+      sentence_bert_config.json, 1_Pooling/config.json
+
+The search app's ./models folder already contains it; copy that folder:
+
+  cp -r ../models/multilingual-e5-small models/
+
+The embedding service needs no other model.

@@ -3,6 +3,12 @@
 Offline Scopus AI / RAG system: hybrid retrieval in Qdrant (vector + BM25 keyword search, RRF fusion),
 BGE reranking and Qwen GGUF answer generation on an NVIDIA GPU.
 
+> **Moving to two separate apps.** The embedding service is now a standalone application in
+> [`embedding/`](embedding/README.md), meant for its own PC: it builds the index and exports it as a
+> bundle (Qdrant snapshot + checksums) that is copied to the search PC. Importing such a bundle into the
+> search app is the next step; until then the built-in `scopus-embedding` service described below
+> still works.
+
 It runs as two web services that share one search index, plus a language model server:
 
 | Service | URL | Purpose |

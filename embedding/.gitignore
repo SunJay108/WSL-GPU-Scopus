@@ -1,0 +1,16 @@
+# Embedding model (copy it in locally, see models/PUT_MODELS_HERE.txt)
+models/*
+!models/PUT_MODELS_HERE.txt
+
+# Input data, index, export bundles, accounts and job state
+data/*/*
+!data/*/.gitkeep
+
+# Saved Docker images for the offline PC (scripts/save_images.sh)
+images/
+
+# Local settings (copy .env.example to .env)
+.env
+
+__pycache__/
+*.pyc
