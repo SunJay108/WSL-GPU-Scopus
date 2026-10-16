@@ -59,10 +59,12 @@ QDRANT_TIMEOUT = _clamp(_env_int("QDRANT_TIMEOUT", 300), 30, 1800)
 
 # Written by the embedding service, read by the search UI.  QDRANT_COLLECTION
 # is a Qdrant alias that always points at the live collection, so a rebuilt
-# index is swapped in atomically.
+# index is swapped in atomically.  The collection holds the dense vectors and
+# the keyword (BM25) index (core/paper_index.py).
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "papers")
-BM25_PATH = os.getenv("BM25_PATH", f"{STORAGE_PATH}/bm25.pkl")
 INDEX_META_PATH = os.getenv("INDEX_META_PATH", f"{STORAGE_PATH}/index_meta.json")
+# Keyword index file of the earlier layout; removed by the next Replace ingest.
+BM25_PATH = os.getenv("BM25_PATH", f"{STORAGE_PATH}/bm25.pkl")
 
 # Accounts, chat history and the activity log (one SQLite file).
 HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", f"{BASE_DATA_DIR}/history/chat_history.sqlite3")
@@ -105,8 +107,12 @@ SUMMARY_MAX_TOKENS = _clamp(_env_int("SUMMARY_MAX_TOKENS", 220), 60, 600)
 # Search service: retrieval, guard, chat
 # =====================================================
 
-VECTOR_TOP_K = _clamp(_env_int("VECTOR_TOP_K", 12), 4, 50)
-HYBRID_TOP_K = _clamp(_env_int("HYBRID_TOP_K", 10), 4, 30)
+# Candidates from the vector search and from the keyword (BM25) search, fused
+# by reciprocal rank in Qdrant; the best HYBRID_TOP_K papers go to the
+# cross-encoder, which keeps RERANK_TOP_N.
+VECTOR_TOP_K = _clamp(_env_int("VECTOR_TOP_K", 30), 4, 100)
+BM25_TOP_K = _clamp(_env_int("BM25_TOP_K", 30), 4, 100)
+HYBRID_TOP_K = _clamp(_env_int("HYBRID_TOP_K", 20), 4, 50)
 RERANK_TOP_N = _clamp(_env_int("RERANK_TOP_N", 5), 1, 20)
 
 # Reranker scores are 0..1 (measured: questions the index covers score
@@ -186,6 +192,11 @@ EMBED_JOB_DIR = os.getenv("EMBED_JOB_DIR", f"{BASE_DATA_DIR}/embedding_jobs")
 EMBED_BATCH_SIZE = _clamp(_env_int("EMBED_BATCH_SIZE", 128), 8, 1024)
 # Half precision for ingest embeddings on CUDA (several times faster).
 EMBED_FP16 = _env_bool("EMBED_FP16", True)
+# Papers read, embedded and uploaded together.  Memory use depends on this,
+# not on the size of the table, so any number of papers can be ingested.
+INGEST_BATCH = _clamp(_env_int("INGEST_BATCH", 1000), 100, 20000)
+# Chunk length and overlap in tokens (about 4 characters each); most
+# abstracts fit in one chunk.
 CHUNK_SIZE = _clamp(_env_int("CHUNK_SIZE", 512), 128, 2048)
 CHUNK_OVERLAP = _clamp(_env_int("CHUNK_OVERLAP", 80), 0, 512)
 MIN_ABSTRACT_CHARS = _clamp(_env_int("MIN_ABSTRACT_CHARS", 50), 0, 2000)

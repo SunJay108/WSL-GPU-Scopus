@@ -46,7 +46,7 @@ A plain `.tar` imports on every WSL version. If you compress it with 7-Zip for t
 extract it back to `.tar` before importing.
 
 Files outside the distro are not part of the export, e.g. `C:\Users\<you>\.wslconfig`
-(optional WSL settings) – copy it separately if you use one.
+(WSL settings) – create it on the offline PC as shown in section 12.
 
 ---
 
@@ -260,6 +260,22 @@ cd ~/Scopus
 ---
 
 # 12. Start Scopus AI normally
+
+**Once per PC: keep WSL running.** By default WSL shuts a distribution down 15 seconds after
+the last WSL window closes, which also stops Docker, the search page and a running ingest.
+Create or edit `C:\Users\<you>\.wslconfig` on Windows (keep any lines already in it):
+
+```ini
+[wsl2]
+vmIdleTimeout=-1
+
+[general]
+instanceIdleTimeout=-1
+```
+
+Then run `wsl --shutdown` in PowerShell once and start WSL again. From now on the services
+keep running after you close the WSL window (they stop only on `wsl --shutdown` or a Windows
+restart; `docker compose up -d` starts them again).
 
 Every time you want to use it:
 
@@ -560,6 +576,15 @@ Windows folder for you.
 Then in http://localhost:7861 open that folder, choose **Add to index** and press **Start ingest**.
 Papers whose DOI is already indexed are skipped.
 
+Any table size works: the ingest reads, embeds and uploads the papers in batches of
+`INGEST_BATCH` (default 1,000), so it needs about 2 GB of memory whether the table has ten thousand
+or a million papers. Time grows with the number of chunks (about 320 chunks per second on an
+RTX 2060; faster GPUs embed faster).
+
+An index built by a version before October 2026 (with `app/data/storage/bm25.pkl`) still answers
+questions, with vector search only. Rebuild it once with **Replace index** (then **Add to index** for
+further folders); the old `bm25.pkl` is deleted automatically.
+
 ---
 
 # 20. GPU embedding configuration
@@ -572,8 +597,7 @@ Qwen2.5 GGUF          → CUDA GPU
 BGE reranker          → CUDA GPU (fp16)
 Qwen3Guard-Stream     → GPU if it fits (answer safety check), else CPU
 Qwen3Guard-Gen        → GPU if it fits (question safety check), else CPU
-Qdrant                → CPU
-BM25                  → CPU
+Qdrant                → CPU (vectors + BM25 keyword index; texts on disk)
 MariaDB               → CPU (only during an ingest)
 ```
 

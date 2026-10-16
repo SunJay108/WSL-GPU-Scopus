@@ -1,6 +1,6 @@
 # Scopus AI — GPU-ready for Ubuntu 24.04 WSL2
 
-Offline Scopus AI / RAG system: hybrid retrieval (BM25 + Qdrant vectors + RRF fusion),
+Offline Scopus AI / RAG system: hybrid retrieval in Qdrant (vector + BM25 keyword search, RRF fusion),
 BGE reranking and Qwen GGUF answer generation on an NVIDIA GPU.
 
 It runs as two web services that share one search index, plus a language model server:
@@ -23,7 +23,7 @@ It runs as two web services that share one search index, plus a language model s
            ▼                                                                    ▼
       ┌─────────┐   alias "papers"  ◀─────────────────────────────────────────────
       │ qdrant  │
-      └─────────┘   app/data/storage/bm25.pkl + index_meta.json  (shared files)
+      └─────────┘   vectors + keyword index;  app/data/storage/index_meta.json (shared file)
 ```
 
 - The build happens on an **online** PC; the result is copied to a **fully offline** PC.
@@ -43,7 +43,9 @@ It runs as two web services that share one search index, plus a language model s
 │   │   ├── auth.py             accounts, password hashes, login sessions
 │   │   ├── web_auth.py         sign-up / login endpoints used by both UIs
 │   │   ├── audit.py            activity log shown in the admin panel
-│   │   └── index_meta.py       description of the live index (written by ingest, read by search)
+│   │   ├── index_meta.py       description of the live index (written by ingest, read by search)
+│   │   ├── paper_index.py      Qdrant layout: dense + BM25 keyword vectors, chunking, payload
+│   │   └── embedding.py        embedding model (multilingual-e5-small) for passages and questions
 │   ├── search_service/         Scopus search UI (port 7860)
 │   │   ├── server.py           REST API: chat, history, admin panel
 │   │   ├── query.py            hybrid retrieval + grounded answer; reloads the index after an ingest
@@ -58,14 +60,14 @@ It runs as two web services that share one search index, plus a language model s
 │   ├── embedding_service/      embedding service (port 7861, administrators only)
 │   │   ├── server.py           REST API
 │   │   ├── jobs.py             background job + progress (one worker process per ingest)
-│   │   ├── pipeline.py         read → chunk → BM25 → embed → Qdrant → publish
+│   │   ├── pipeline.py         batches of papers: read → chunk → embed → Qdrant; publish
 │   │   ├── sources.py          MySQL (MyISAM via MariaDB) and RIS readers
 │   │   └── static/             web UI (no external resources; works offline)
 │   ├── ingest.py               command line: ingest without the UI
 │   ├── users.py                command line: accounts (password reset)
 │   └── data/
 │       ├── mysql/              example MySQL data (3 tables)
-│       ├── storage/            bm25.pkl, index_meta.json (written by ingest)
+│       ├── storage/            index_meta.json (written by ingest)
 │       └── history/            chat_history.sqlite3
 ├── models/
 ├── qdrant_data/
@@ -164,9 +166,10 @@ For a fully offline PC, export the whole WSL distro – see `Deploy-GPU-Project-
    do not want.
 3. Choose the mode:
    - **Replace index** – builds a fresh index from this folder.
-   - **Add to index** – adds papers whose DOI is not indexed yet (keeps the existing index).
+   - **Add to index** – adds papers whose DOI (or title, without DOI) is not indexed yet.
 4. Press **Start ingest**. The status panel shows each stage
-   (scan → load MySQL tables → read → chunk → BM25 → embed → optimize → publish),
+   (scan → read the current index (add mode) → load MySQL tables → read, embed & upload papers →
+   optimize → publish),
    a progress bar with ETA, counters and a log. The browser tab title shows the percentage.
 5. When it finishes, a browser **alert** reports the result. The Scopus search UI switches to the
    new index automatically (no restart).
@@ -330,7 +333,7 @@ The parts that limit the number of users are separated so each can grow with the
 | Model size | `LLM_MODEL` can point to a larger GGUF model (e.g. a 7B or 14B instruct model) for better answers; the grounding check still keeps only supported sentences. |
 | Search UI | Answer streams are asynchronous (no thread per waiting user); up to `LLM_PARALLEL` questions are processed at once, the rest wait in arrival order. |
 | Safety models | Put on the GPU automatically when they fit (`SAFETY_*_DEVICE=auto`), on the CPU otherwise. |
-| Retrieval | Qdrant + BM25 + reranker take about 1 s per question and are not the bottleneck. |
+| Retrieval | Vector + BM25 search in Qdrant (on disk, nothing loaded into RAM) + reranker take well under 1 s per question. |
 
 To use a larger GPU: set `LLM_PARALLEL` (memory per slot: about 150 MB for this 3B model at
 `LLM_CTX=4096`, more for larger models), run `docker compose up -d`, then measure with
@@ -458,6 +461,19 @@ chmod +x import_offline.sh verify_gpu.sh
 
 Then open http://localhost:7861 to ingest data and http://localhost:7860 to search.
 Everything needed at runtime (models, tokenizer data, UI assets, fonts) is local.
+
+Keep WSL running when no WSL window is open (otherwise WSL stops Docker, the search page and a
+running ingest 15 seconds after the last window closes): add to `C:\Users\<you>\.wslconfig`
+
+```ini
+[wsl2]
+vmIdleTimeout=-1
+
+[general]
+instanceIdleTimeout=-1
+```
+
+and run `wsl --shutdown` once (see section 12 of `Deploy-GPU-Project-Offline.md`).
 
 ## 13. Notes
 

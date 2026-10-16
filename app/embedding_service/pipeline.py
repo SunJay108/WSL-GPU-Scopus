@@ -1,19 +1,23 @@
 """
-Ingestion pipeline: folder -> papers -> chunks -> BM25 + Qdrant vectors.
+Ingestion pipeline: folder -> papers -> chunks -> Qdrant (dense + keyword vectors).
 
-Replace mode builds a brand-new Qdrant collection and only switches the
+Papers are processed in batches (read, chunk, embed, upload), so memory use
+stays the same for ten thousand or ten million papers; the keyword (BM25)
+index is part of the Qdrant collection (core/paper_index.py).
+
+Replace mode builds a brand-new collection and only switches the
 `QDRANT_COLLECTION` alias to it once everything succeeded, so the Scopus UI
 keeps answering from the old index during the whole run.  Append mode adds
-papers whose DOI is not indexed yet to the live collection.
+papers that are not indexed yet to the live collection and removes them
+again if the run fails.
 """
 
-import gc
 import os
-import pickle
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from core import embedding, paper_index
 from core.config import (
     BM25_PATH,
     CHUNK_OVERLAP,
@@ -22,6 +26,7 @@ from core.config import (
     EMBED_DEVICE,
     EMBED_FP16,
     EMBED_MODEL_PATH,
+    INGEST_BATCH,
     MARIADB_STAGING_DB,
     MIN_ABSTRACT_CHARS,
     OPTIMIZE_TIMEOUT,
@@ -38,17 +43,15 @@ from .sources import MariaDBStaging, iter_ris_papers, scan_folder
 STAGES = [
     # key, label, weight in the overall progress bar
     ("scan", "Scan folder", 1),
+    ("existing", "Read the current index", 3),
     ("stage", "Load MySQL tables", 4),
-    ("read", "Read records", 6),
-    ("chunk", "Split into chunks", 6),
-    ("bm25", "Build keyword index (BM25)", 8),
-    ("embed", "Embed & upload vectors", 68),
+    ("index", "Read, embed & upload papers", 85),
     ("optimize", "Optimize vector index", 5),
     ("publish", "Publish index", 2),
 ]
 
-UPLOAD_STEP = 256   # points per Qdrant upload request
-EMBED_STEP = 1024   # chunks per encode call; sentence-transformers length-sorts within it
+UPLOAD_STEP = 512        # points per Qdrant upload request
+CHARS_PER_TOKEN = 4      # CHUNK_SIZE / CHUNK_OVERLAP are given in tokens
 _VERSIONED_COLLECTION = re.compile(rf"^{re.escape(QDRANT_COLLECTION)}_\d{{8}}_\d{{6}}$")
 
 
@@ -102,13 +105,13 @@ def run_ingest(folder, tables=None, include_ris=True, mode="replace",
     rep = rep or ConsoleReporter()
     started = time.time()
     version = time.strftime("%Y%m%d_%H%M%S")
-    bm25_tmp = BM25_PATH + ".new"
 
     staging = None
     new_collection = None
-    appended_ids = []
+    appended = False
     published = False
     client = None
+    target = None
 
     try:
         # ---------- 1. scan ----------
@@ -141,105 +144,103 @@ def run_ingest(folder, tables=None, include_ris=True, mode="replace",
         except Exception as exc:
             raise IngestError(f"Cannot reach Qdrant at {QDRANT_URL}: {exc}") from exc
 
-        existing_docs = []
+        previous = read_index_meta() or {}
         if mode == "append":
-            if live_collection is None or not os.path.exists(BM25_PATH):
+            if live_collection is None:
                 rep.log("No existing index found – building a new one instead of appending.")
                 mode = "replace"
-            else:
-                rep.log("Loading the current keyword index to append to it...")
-                with open(BM25_PATH, "rb") as f:
-                    _, existing_docs = pickle.load(f)
+            elif paper_index.is_legacy(client, live_collection):
+                raise IngestError(
+                    "The current index was built by an earlier version and cannot be extended. "
+                    "Use 'Replace index' once (then 'Add to index' for further folders)."
+                )
         rep.finish("scan")
 
-        # ---------- 2. stage MySQL tables ----------
+        # ---------- 2. papers already in the index ----------
+        seen = set()
+        if mode == "append":
+            rep.begin("existing", detail=f"collection {live_collection}")
+            seen = indexed_papers(client, live_collection, rep)
+            rep.finish("existing", detail=f"{len(seen):,} papers already indexed")
+        else:
+            rep.skip("existing", "new index")
+
+        # ---------- 3. stage MySQL tables ----------
         if selected:
             staging = MariaDBStaging(staging_db, rep)
             staging.stage(selected)
         else:
             rep.skip("stage", "no MySQL tables")
 
-        # ---------- 3. read records ----------
-        papers, stats = read_papers(staging, selected, ris_files, existing_docs, rep)
+        # ---------- 4. read, embed, upload (in batches) ----------
+        prior_papers = len(seen)
+        model = load_embed_model(EMBED_DEVICE, rep)
+        indexer = None
+        try:
+            dim = len(embedding.embed_passages(model, ["dimension probe"])[0])
+            if mode == "replace":
+                drop_orphan_collections(client, live_collection, rep)
+                new_collection = f"{QDRANT_COLLECTION}_{version}"
+                paper_index.create_collection(client, new_collection, dim)
+                target = new_collection
+                avg_tokens = None                      # measured on the first batch
+            else:
+                target = live_collection
+                if paper_index.dense_size(client, target) != dim:
+                    raise IngestError(
+                        f"The current index uses {paper_index.dense_size(client, target)}-dimensional "
+                        f"vectors but the embedding model produces {dim}. Use 'Replace' mode instead."
+                    )
+                avg_tokens = previous.get("bm25_avg_tokens") or paper_index.DEFAULT_AVG_TOKENS
+                appended = True
+
+            indexer = Indexer(client, target, model, version, avg_tokens, rep)
+            stats = index_papers(staging, selected, ris_files, seen, indexer, rep)
+        finally:
+            if indexer is not None:
+                model = indexer.model          # it may have switched to the CPU
+                indexer.close()
+            embedding.release(model)
         if staging is not None:
             staging.drop()
             staging = None
-        if not papers:
+        if not stats["papers"]:
             if mode == "append" and stats["skipped_duplicate"]:
                 raise IngestError("All papers in this folder are already in the index.")
             raise IngestError(
                 f"No records with an abstract of at least {MIN_ABSTRACT_CHARS} characters were found."
             )
 
-        # ---------- 4. chunk ----------
-        nodes = build_nodes(papers, rep)
-        sources = summarize_sources(papers)
-        del papers
-
-        # ---------- 5. BM25 ----------
-        new_docs = [{"node_id": n.node_id, "text": n.text, "metadata": n.metadata} for n in nodes]
-        corpus = existing_docs + new_docs
-        build_bm25(corpus, bm25_tmp, rep)
-        total_chunks = len(corpus)
-        total_papers = count_papers(corpus)
-        prior_papers = count_papers(existing_docs)
-        del corpus, existing_docs, new_docs
-        gc.collect()
-
-        # ---------- 6. embed ----------
-        embed_model = load_embed_model(EMBED_DEVICE, rep)
-        try:
-            dim = len(embed_model.get_text_embedding("dimension probe"))
-
-            if mode == "replace":
-                drop_orphan_collections(client, live_collection, rep)
-                new_collection = f"{QDRANT_COLLECTION}_{version}"
-                create_collection(client, new_collection, dim)
-                target = new_collection
-            else:
-                target = live_collection
-                live_dim = collection_dim(client, target)
-                if live_dim != dim:
-                    raise IngestError(
-                        f"The current index uses {live_dim}-dimensional vectors but the "
-                        f"embedding model produces {dim}. Use 'Replace' mode instead."
-                    )
-
-            embed_and_upload(
-                nodes, embed_model, client, target, rep,
-                appended_ids if mode == "append" else None,
-            )
-        finally:
-            release_model(embed_model)
-        del nodes
-
-        # ---------- 7. optimize ----------
+        # ---------- 5. optimize ----------
         wait_for_index(client, target, rep)
 
-        # ---------- 8. publish ----------
+        # ---------- 6. publish ----------
         rep.begin("publish", detail="Switching the Scopus UI to the new index")
         if mode == "replace":
             with_qdrant_retry(lambda: publish_collection(client, target, rep), rep)
-        os.replace(bm25_tmp, BM25_PATH)
+            try:
+                os.remove(BM25_PATH)   # keyword index of the old layout; now part of Qdrant
+                rep.log("Removed the old keyword index file (bm25.pkl).")
+            except OSError:
+                pass
 
-        prior_sources = []
-        if mode == "append":
-            previous = read_index_meta() or {}
-            prior_sources = previous.get("sources") or [
-                {"name": "existing index", "papers": prior_papers, "added_at": None}
-            ]
+        added_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        sources = [{"name": name, "papers": n, "added_at": added_at} for name, n in stats["sources"].items()]
+        prior_sources = (previous.get("sources") or []) if mode == "append" else []
         points = with_qdrant_retry(lambda: client.get_collection(target).points_count, rep) or 0
         meta = {
             "version": version,
-            "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "built_at": added_at,
             "mode": mode,
             "collection": target,
             "alias": QDRANT_COLLECTION,
-            "papers": total_papers,
-            "chunks": total_chunks,
+            "layout": "dense+bm25",
+            "papers": prior_papers + stats["papers"],
+            "chunks": points,
             "vectors": points,
             "embed_model": os.path.basename(EMBED_MODEL_PATH.rstrip("/")),
             "embed_dim": dim,
+            "bm25_avg_tokens": indexer.avg_tokens,
             "sources": prior_sources + sources,
         }
         write_index_meta(meta)
@@ -251,7 +252,7 @@ def run_ingest(folder, tables=None, include_ris=True, mode="replace",
             "mode": mode,
             "papers_added": stats["papers"],
             "papers_total": meta["papers"],
-            "chunks_total": total_chunks,
+            "chunks_total": points,
             "vectors": points,
             "rows_read": stats["rows"],
             "skipped_no_abstract": stats["skipped_no_abstract"],
@@ -268,29 +269,46 @@ def run_ingest(folder, tables=None, include_ris=True, mode="replace",
         if staging is not None:
             staging.drop()
         if not published:
-            _rollback(client, new_collection, appended_ids, rep)
-            try:
-                os.remove(bm25_tmp)
-            except OSError:
-                pass
+            _rollback(client, new_collection, target if appended else None, version, rep)
 
 
 # =====================================================
 # Steps
 # =====================================================
 
-def read_papers(staging, tables, ris_files, existing_docs, rep):
-    stats = {"rows": 0, "papers": 0, "skipped_no_abstract": 0, "skipped_duplicate": 0}
-    seen = {
-        (d["metadata"].get("doi") or "").lower()
-        for d in existing_docs
-    }
-    seen.discard("")
-    papers = []
+def indexed_papers(client, collection, rep):
+    """Keys of the papers in `collection` (read page by page; only the key field)."""
+    seen, offset = set(), None
+    total = with_qdrant_retry(lambda: client.get_collection(collection).points_count, rep) or 0
+    done = 0
+    while True:
+        points, offset = with_qdrant_retry(lambda: client.scroll(
+            collection, limit=10000, offset=offset, with_payload=["paper"], with_vectors=False), rep)
+        for p in points:
+            seen.add(p.payload.get("paper"))
+        done += len(points)
+        rep.progress(done, total)
+        rep.check_cancel()
+        if offset is None:
+            break
+    seen.discard(None)
+    return seen
 
+
+def index_papers(staging, tables, ris_files, seen, indexer, rep):
+    """Stream the records of all tables and RIS files through the indexer, INGEST_BATCH papers at a time."""
+    stats = {"rows": 0, "papers": 0, "skipped_no_abstract": 0, "skipped_duplicate": 0, "sources": {}}
     totals = {t.name: staging.count_rows(t.name) for t in tables} if tables else {}
     total = sum(totals.values()) or None
-    rep.begin("read", total=total)
+    rep.begin("index", total=total, detail=f"on {embedding.device_label(indexer.model)}")
+    batch = []
+
+    def report():
+        rep.progress(stats["rows"], total, detail=indexer.speed())
+        rep.count(rows=stats["rows"], papers=stats["papers"],
+                  skipped_no_abstract=stats["skipped_no_abstract"],
+                  skipped_duplicate=stats["skipped_duplicate"],
+                  chunks=indexer.chunks, embedded=indexer.chunks)
 
     def consume(iterator):
         for paper in iterator:
@@ -298,19 +316,19 @@ def read_papers(staging, tables, ris_files, existing_docs, rep):
             if len(paper["abstract"]) < MIN_ABSTRACT_CHARS:
                 stats["skipped_no_abstract"] += 1
             else:
-                key = paper["doi"].lower()
-                if key and key in seen:
+                key = paper_index.paper_key(paper["doi"], paper["title"])
+                if key in seen:
                     stats["skipped_duplicate"] += 1
                 else:
-                    if key:
-                        seen.add(key)
-                    papers.append(paper)
-
-            if stats["rows"] % 2000 == 0:
-                rep.progress(stats["rows"], total)
-                rep.count(rows=stats["rows"], papers=len(papers),
-                          skipped_no_abstract=stats["skipped_no_abstract"],
-                          skipped_duplicate=stats["skipped_duplicate"])
+                    seen.add(key)
+                    paper["key"] = key
+                    batch.append(paper)
+                    stats["papers"] += 1
+                    stats["sources"][paper["source"]] = stats["sources"].get(paper["source"], 0) + 1
+            if len(batch) >= INGEST_BATCH:
+                indexer.add(batch)
+                batch.clear()
+                report()
                 rep.check_cancel()
 
     for table in tables:
@@ -325,166 +343,104 @@ def read_papers(staging, tables, ris_files, existing_docs, rep):
         consume(iter_ris_papers(ris_file))
         rep.log(f"{ris_file.name}: {stats['rows'] - before:,} records read")
 
-    stats["papers"] = len(papers)
-    rep.count(rows=stats["rows"], papers=len(papers),
-              skipped_no_abstract=stats["skipped_no_abstract"],
-              skipped_duplicate=stats["skipped_duplicate"])
+    if batch:
+        indexer.add(batch)
+    indexer.flush()
+    report()
     rep.finish(
-        "read",
-        detail=f"{len(papers):,} papers kept, {stats['skipped_no_abstract']:,} without abstract, "
-        f"{stats['skipped_duplicate']:,} duplicates",
+        "index",
+        detail=f"{stats['papers']:,} papers ({indexer.chunks:,} chunks) indexed, "
+        f"{stats['skipped_no_abstract']:,} without abstract, {stats['skipped_duplicate']:,} duplicates",
     )
-    return papers, stats
+    return stats
 
 
-def build_weighted_text(p):
-    """Same layout as the original RIS ingest: title and keywords are repeated as a boost."""
-    parts = []
+class Indexer:
+    """
+    Chunks a batch of papers, embeds it on the GPU and uploads it to Qdrant;
+    the upload of one batch overlaps with embedding the next.  At most two
+    batches are in memory.
+    """
 
-    if p["title"]:
-        parts.append("Title: " + p["title"])
-        parts.append("Title: " + p["title"])
+    def __init__(self, client, collection, model, version, avg_tokens, rep):
+        self.client, self.collection, self.model = client, collection, model
+        self.version, self.avg_tokens, self.rep = version, avg_tokens, rep
+        self.encode_batch = EMBED_BATCH_SIZE
+        self.max_chars = CHUNK_SIZE * CHARS_PER_TOKEN
+        self.overlap_chars = CHUNK_OVERLAP * CHARS_PER_TOKEN
+        self.chunks = 0
+        self.started = time.time()
+        self.uploader = ThreadPoolExecutor(max_workers=1)
+        self.pending = None
 
-    if p["keywords"]:
-        kw = ", ".join(p["keywords"])
-        parts.append("Keywords: " + kw)
-        parts.append("Keywords: " + kw)
+    def add(self, papers):
+        items = [(p, n, text) for p in papers
+                 for n, text in enumerate(paper_index.chunk_paper(p, self.max_chars, self.overlap_chars))]
+        if self.avg_tokens is None:   # first batch of a new index: average document length
+            lengths = [len(paper_index.tokenize(paper_index.keyword_text(p, t))) for p, _, t in items]
+            self.avg_tokens = round(sum(lengths) / max(1, len(lengths)), 1)
+            self.rep.log(f"Keyword index: average passage length {self.avg_tokens} words")
+        vectors = self._embed([text for _, _, text in items])     # the GPU part
+        # Keyword vectors and the upload run in the background while the GPU
+        # embeds the next batch.
+        self.flush()
+        self.pending = self.uploader.submit(self._upload, items, vectors)
+        self.chunks += len(items)
 
-    if p["authors"]:
-        parts.append("Authors: " + ", ".join(p["authors"]))
-
-    if p["journal"]:
-        parts.append("Journal: " + p["journal"])
-
-    if p["year"]:
-        parts.append("Year: " + p["year"])
-
-    if p["abstract"]:
-        parts.append("Abstract:\n" + p["abstract"])
-
-    return "\n\n".join(parts)
-
-
-def build_nodes(papers, rep, batch=500):
-    _use_bundled_nltk_data()
-    from llama_index.core import Document
-    from llama_index.core.node_parser import SentenceSplitter
-
-    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    rep.begin("chunk", total=len(papers))
-
-    nodes = []
-    for start in range(0, len(papers), batch):
-        docs = [
-            Document(
-                text=build_weighted_text(p),
-                metadata={
-                    "title": p["title"][:300],
-                    "doi": p["doi"],
-                    "year": p["year"],
-                    "journal": p["journal"][:200],
-                    "source": p["source"],
-                },
-                # Traceability only: keep it out of the embedded / LLM text.
-                excluded_embed_metadata_keys=["source"],
-                excluded_llm_metadata_keys=["source"],
-            )
-            for p in papers[start:start + batch]
-        ]
-        nodes.extend(splitter.get_nodes_from_documents(docs))
-
-        done = min(start + batch, len(papers))
-        rep.progress(done, len(papers), detail=f"{len(nodes):,} chunks")
-        rep.count(chunks=len(nodes))
-        rep.check_cancel()
-
-    rep.finish("chunk", detail=f"{len(nodes):,} chunks from {len(papers):,} papers")
-    return nodes
-
-
-def build_bm25(corpus, path, rep):
-    from rank_bm25 import BM25Okapi
-
-    rep.begin("bm25", total=len(corpus), detail="Tokenizing")
-    tokenized = []
-    for i, doc in enumerate(corpus, 1):
-        # Must match the tokenisation in query.py.
-        tokenized.append(doc["text"].lower().split())
-        if i % 20000 == 0:
-            rep.progress(i, len(corpus), detail="Tokenizing")
-            rep.check_cancel()
-
-    rep.progress(len(corpus), len(corpus), detail="Computing term statistics")
-    bm25 = BM25Okapi(tokenized)
-    del tokenized
-    rep.check_cancel()
-
-    rep.progress(len(corpus), len(corpus), detail="Saving")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump((bm25, corpus), f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    rep.finish("bm25", detail=f"{len(corpus):,} chunks, {os.path.getsize(path) / 1e6:,.0f} MB")
-
-
-def embed_and_upload(nodes, embed_model, client, collection, rep, appended_ids=None):
-    """Embed on the GPU while the previous batch uploads to Qdrant."""
-    from llama_index.core.schema import MetadataMode
-    from llama_index.vector_stores.qdrant import QdrantVectorStore
-
-    vector_store = QdrantVectorStore(
-        client=client,
-        collection_name=collection,
-        batch_size=UPLOAD_STEP,
-    )
-
-    total = len(nodes)
-    rep.begin("embed", total=total, detail=f"on {_device_label(embed_model)}")
-    step = max(EMBED_BATCH_SIZE, EMBED_STEP)
-
-    def upload(batch):
-        vector_store.add(batch)
-        if appended_ids is not None:
-            appended_ids.extend(n.node_id for n in batch)
-        for n in batch:
-            n.embedding = None  # free memory once stored in Qdrant
-
-    pending = None
-    done = 0
-    started = time.time()
-
-    with ThreadPoolExecutor(max_workers=1) as uploader:
-        while done < total:
-            rep.check_cancel()
-            batch = nodes[done:done + step]
-            # Same text the original VectorStoreIndex embedded: metadata header + chunk.
-            texts = [n.get_content(metadata_mode=MetadataMode.EMBED) for n in batch]
-
+    def _embed(self, texts):
+        while True:
             try:
-                vectors = embed_model.get_text_embedding_batch(texts)
+                return embedding.embed_passages(self.model, texts, batch_size=self.encode_batch)
             except Exception as exc:
                 if not _is_cuda_oom(exc):
                     raise
-                embed_model = _handle_oom(embed_model, rep)
-                continue
+                self._handle_oom()
 
-            for node, vector in zip(batch, vectors):
-                node.embedding = vector
+    def _handle_oom(self):
+        """Halve the batch size; below 8 continue on the CPU."""
+        import torch
+        torch.cuda.empty_cache()
+        if self.encode_batch > 8:
+            self.encode_batch //= 2
+            self.rep.log(f"GPU out of memory – retrying with batch size {self.encode_batch}", "warning")
+            return
+        self.rep.log("GPU out of memory even at batch size 8 – continuing on CPU", "warning")
+        embedding.release(self.model)
+        self.model = embedding.load("cpu", fp16=False)
 
-            if pending is not None:
-                pending.result()
-            pending = uploader.submit(upload, batch)
+    def _upload(self, items, vectors):
+        from qdrant_client.http import models
 
-            done += len(batch)
-            elapsed = max(time.time() - started, 1e-6)
-            rate = done / elapsed
-            rep.progress(done, total, detail=f"{rate:,.0f} chunks/s on {_device_label(embed_model)}")
-            rep.count(embedded=done)
+        points = []
+        for (paper, n, text), vector in zip(items, vectors):
+            indices, values = paper_index.sparse_document(paper_index.keyword_text(paper, text), self.avg_tokens)
+            points.append(models.PointStruct(
+                id=paper_index.point_id(paper["key"], n),
+                vector={paper_index.DENSE: vector,
+                        paper_index.SPARSE: models.SparseVector(indices=indices, values=values)},
+                payload={"text": text, "title": paper["title"], "doi": paper["doi"], "year": paper["year"],
+                         "journal": paper["journal"], "source": paper["source"], "paper": paper["key"],
+                         "chunk": n, "batch": self.version},
+            ))
+        for start in range(0, len(points), UPLOAD_STEP):
+            part = points[start:start + UPLOAD_STEP]
+            with_qdrant_retry(lambda: self.client.upsert(self.collection, points=part, wait=True), self.rep)
 
-        if pending is not None:
-            pending.result()
+    def flush(self):
+        """Wait for the previous upload (and raise its error, if any)."""
+        if self.pending is not None:
+            self.pending.result()
+            self.pending = None
 
-    rep.finish("embed", detail=f"{total:,} vectors uploaded")
+    def speed(self):
+        rate = self.chunks / max(time.time() - self.started, 1e-6)
+        return f"{self.chunks:,} chunks · {rate:,.0f}/s on {embedding.device_label(self.model)}"
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            self.uploader.shutdown(wait=True)
 
 
 def wait_for_index(client, collection, rep):
@@ -531,22 +487,6 @@ def resolve_live_collection(client):
     if client.collection_exists(QDRANT_COLLECTION):
         return QDRANT_COLLECTION  # layout from before the embedding service
     return None
-
-
-def collection_dim(client, name):
-    vectors = client.get_collection(name).config.params.vectors
-    return vectors.size if hasattr(vectors, "size") else next(iter(vectors.values())).size
-
-
-def create_collection(client, name, dim):
-    models = _models()
-    # Same parameters as the original ingest.  Qdrant indexes progressively
-    # while the (much slower) embedding runs, so the final optimize is short.
-    client.create_collection(
-        collection_name=name,
-        vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
-        hnsw_config=models.HnswConfigDiff(m=32, ef_construct=256),
-    )
 
 
 def with_qdrant_retry(fn, rep, timeout=180):
@@ -603,21 +543,20 @@ def drop_orphan_collections(client, keep, rep):
             rep.log(f"Deleted leftover collection '{collection.name}' from an unfinished run")
 
 
-def _rollback(client, new_collection, appended_ids, rep):
+def _rollback(client, new_collection, appended_to, version, rep):
+    """Undo an unfinished run: drop its new collection, or the points it appended."""
     if client is None:
         return
+    models = _models()
     try:
         if new_collection and client.collection_exists(new_collection):
             client.delete_collection(new_collection)
             rep.log(f"Discarded unfinished collection '{new_collection}'; the current index is unchanged.")
-        if appended_ids:
-            live = resolve_live_collection(client)
-            if live:
-                client.delete(
-                    collection_name=live,
-                    points_selector=_models().PointIdsList(points=appended_ids),
-                )
-                rep.log(f"Removed {len(appended_ids):,} partially appended vectors.")
+        if appended_to:
+            client.delete(collection_name=appended_to, points_selector=models.FilterSelector(
+                filter=models.Filter(must=[models.FieldCondition(
+                    key="batch", match=models.MatchValue(value=version))])))
+            rep.log("Removed the partially appended papers; the index is as before.")
     except Exception as exc:
         rep.log(f"Cleanup after failure was incomplete: {exc}", level="warning")
 
@@ -628,106 +567,25 @@ def _rollback(client, new_collection, appended_ids, rep):
 
 def load_embed_model(requested, rep):
     import torch
-    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-    device = (requested or "cpu").strip().lower()
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        rep.log("CUDA requested but unavailable; embedding on CPU (much slower).", "warning")
-        device = "cpu"
-
+    device = embedding.resolve_device(requested)
     rep.log(f"Loading embedding model {os.path.basename(EMBED_MODEL_PATH.rstrip('/'))} on {device}...")
     try:
-        # Same class and defaults as query.py, so query and document vectors match.
-        model = HuggingFaceEmbedding(
-            model_name=EMBED_MODEL_PATH,
-            device=device,
-            embed_batch_size=EMBED_BATCH_SIZE,
-        )
-        if device.startswith("cuda") and EMBED_FP16:
-            # ~4x faster on consumer GPUs; vectors match fp32 to ~1e-3 cosine.
-            model._model.half()
-        model.get_text_embedding("warm-up")
+        model = embedding.load(device, fp16=EMBED_FP16)
+        embedding.embed_passages(model, ["warm-up"])
         return model
     except Exception as exc:
         if device == "cpu" or not _is_cuda_oom(exc):
             raise
-        model = None
-        gc.collect()
         torch.cuda.empty_cache()
         rep.log(
-            "Not enough free GPU memory for the embedding model (the Scopus UI's LLM "
-            "uses most of it) – embedding on CPU instead. To use the GPU for large "
-            "ingests, stop the search UI first: docker compose stop scopus-ai",
+            "Not enough free GPU memory for the embedding model – embedding on CPU instead. "
+            "To use the GPU for large ingests, stop the search UI first: docker compose stop scopus-ai",
             "warning",
         )
         return load_embed_model("cpu", rep)
 
 
-def release_model(model):
-    del model
-    gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
-def _device_label(embed_model):
-    label = str(getattr(embed_model, "_device", "?"))
-    try:
-        import torch
-        if next(embed_model._model.parameters()).dtype == torch.float16:
-            label += " (fp16)"
-    except Exception:
-        pass
-    return label
-
-
 def _is_cuda_oom(exc):
     text = f"{type(exc).__name__} {exc}".lower()
     return "out of memory" in text or "outofmemory" in text or "cublas_status_alloc_failed" in text
-
-
-def _handle_oom(embed_model, rep):
-    """Halve the batch size; below 8 fall back to the CPU."""
-    import torch
-    torch.cuda.empty_cache()
-
-    if embed_model.embed_batch_size > 8:
-        embed_model.embed_batch_size //= 2
-        rep.log(f"GPU out of memory – retrying with batch size {embed_model.embed_batch_size}", "warning")
-        return embed_model
-
-    rep.log("GPU out of memory even at batch size 8 – continuing on CPU", "warning")
-    release_model(embed_model)
-    return load_embed_model("cpu", rep)
-
-
-def _use_bundled_nltk_data():
-    """
-    SentenceSplitter needs NLTK stopwords/punkt.  llama-index ships them in its
-    package but looks under $NLTK_DATA (or ~/.cache) and otherwise downloads
-    them from GitHub, which fails on the offline PC.
-    """
-    import llama_index.core
-
-    os.environ.setdefault("NLTK_DATA", os.path.dirname(llama_index.core.__file__))
-
-
-def count_papers(docs):
-    """Distinct papers in a BM25 corpus (a paper may span several chunks)."""
-    keys = set()
-    for d in docs:
-        md = d["metadata"]
-        keys.add((md.get("doi") or "").lower() or "title:" + (md.get("title") or ""))
-    return len(keys)
-
-
-def summarize_sources(papers):
-    counts = {}
-    for p in papers:
-        counts[p["source"]] = counts.get(p["source"], 0) + 1
-    added = time.strftime("%Y-%m-%d %H:%M:%S")
-    return [{"name": name, "papers": n, "added_at": added} for name, n in counts.items()]

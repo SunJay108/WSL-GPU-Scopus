@@ -1,17 +1,17 @@
 """
 Shared description of the live search index.
 
-The embedding service publishes a new index by switching the Qdrant alias,
-replacing bm25.pkl and finally writing index_meta.json.  The Scopus UI checks
-index_signature() before each query and reloads its BM25/vector handles when
-the files change, so no restart is needed after an ingest.
+The embedding service publishes a new index by switching the Qdrant alias
+and then writing index_meta.json.  The Scopus UI searches through the alias,
+so it uses a new index at once; index_signature() tells it when to re-read
+the index description.
 """
 
 import json
 import os
 import tempfile
 
-from .config import BM25_PATH, INDEX_META_PATH
+from .config import INDEX_META_PATH
 
 
 def read_index_meta():
@@ -50,11 +50,8 @@ def atomic_write_json(path: str, data) -> None:
 
 
 def index_signature():
-    """Cheap change detector: modification times of the meta file and BM25 pickle."""
-    signature = []
-    for path in (INDEX_META_PATH, BM25_PATH):
-        try:
-            signature.append(os.stat(path).st_mtime_ns)
-        except OSError:
-            signature.append(None)
-    return tuple(signature)
+    """Cheap change detector: modification time of the index description."""
+    try:
+        return os.stat(INDEX_META_PATH).st_mtime_ns
+    except OSError:
+        return None

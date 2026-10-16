@@ -1,8 +1,9 @@
 """
-Answering pipeline: hybrid retrieval (Qdrant vectors + BM25, RRF fusion,
-cross-encoder rerank), grounded generation by the language model server
-(llm.py), summary, citations and follow-up suggestions.  Reloads the index
-when the embedding service publishes a new one.
+Answering pipeline: hybrid retrieval in Qdrant (vector + BM25 keyword search,
+reciprocal rank fusion), cross-encoder rerank, grounded generation by the
+language model server (llm.py), summary, citations and follow-up
+suggestions.  The index is searched through its Qdrant alias, so a newly
+published index is used at once and nothing large is held in memory.
 
 Answers contain only what the retrieved papers say: the model writes from
 numbered sources, and every sentence is checked against them before it is
@@ -10,21 +11,18 @@ shown (grounding.py); unsupported sentences are dropped.  Up to LLM_PARALLEL
 questions are answered at the same time.
 """
 
-import os
-import pickle
 import re
 import threading
 import time
 
 import torch
 
-from llama_index.core import VectorStoreIndex
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.schema import NodeWithScore, TextNode
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 
+from core import embedding, paper_index
 from core.config import *
 from core.index_meta import index_signature, read_index_meta
 from . import grounding, llm, safety
@@ -39,12 +37,11 @@ from .guard import check_question
 
 _embed_model = None
 _reranker = None
+_qdrant = None
 
-# Rebuilt whenever the embedding service publishes a new index.
-_retriever = None
-_bm25_index = None
-_bm25_corpus = None
+# Layout of the live collection, re-checked when a new index is published.
 _index_signature = None
+_legacy_index = None
 
 _load_lock = threading.RLock()
 # The embedding model and reranker are shared by all questions; their
@@ -109,54 +106,43 @@ def resolve_device(requested: str) -> str:
 
 
 # =====================================================
-# Index hot-reload
+# Index (Qdrant)
 # =====================================================
 
-def _refresh_if_index_changed():
-    """Drop the BM25/vector handles when the embedding service published a new index."""
-    global _retriever, _bm25_index, _bm25_corpus, _index_signature
-
-    signature = index_signature()
-    if signature != _index_signature:
-        if _index_signature is not None:
-            print("🔄 Search index changed on disk; reloading BM25 and vector retriever.")
-        _retriever = None
-        _bm25_index = None
-        _bm25_corpus = None
-        _index_signature = signature
-
-
-def _collection_available(client) -> bool:
-    if any(a.alias_name == QDRANT_COLLECTION for a in client.get_aliases().aliases):
-        return True
-    return client.collection_exists(QDRANT_COLLECTION)
-
-
-# =====================================================
-# BM25
-# =====================================================
-
-def load_bm25():
-    if not os.path.exists(BM25_PATH):
-        raise IndexNotReady(f"{BM25_PATH} not found")
-    with open(BM25_PATH, "rb") as f:
-        return pickle.load(f)
-
-
-def get_bm25():
-    global _bm25_index, _bm25_corpus
-
+def get_qdrant():
+    global _qdrant
     with _load_lock:
-        _refresh_if_index_changed()
-        if _bm25_index is None:
-            print("Loading BM25 index...")
-            _bm25_index, _bm25_corpus = load_bm25()
+        if _qdrant is None:
+            _qdrant = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT)
+        return _qdrant
 
-        return _bm25_index, _bm25_corpus
+
+def _index_is_legacy():
+    """
+    True when the live collection has the layout of earlier versions (dense
+    vectors only, keyword index in bm25.pkl); re-checked after each publish.
+    """
+    global _index_signature, _legacy_index
+    with _load_lock:
+        signature = index_signature()
+        if _legacy_index is None or signature != _index_signature:
+            client = get_qdrant()
+            if not (any(a.alias_name == QDRANT_COLLECTION for a in client.get_aliases().aliases)
+                    or client.collection_exists(QDRANT_COLLECTION)):
+                raise IndexNotReady(f"Qdrant collection '{QDRANT_COLLECTION}' not found")
+            published = _legacy_index is not None      # a new index replaced the one in use
+            _legacy_index = paper_index.is_legacy(client, QDRANT_COLLECTION)
+            _index_signature = signature
+            if _legacy_index:
+                print("⚠️ The index has the layout of an earlier version: vector search only (no keyword "
+                      "search) until the next 'Replace index' ingest.")
+            if published:
+                threading.Thread(target=warm_up_index, name="index-warm-up", daemon=True).start()
+        return _legacy_index
 
 
 # =====================================================
-# Models / retriever
+# Models
 # =====================================================
 
 def get_embed_model():
@@ -164,15 +150,8 @@ def get_embed_model():
 
     with _load_lock:
         if _embed_model is None:
-            embed_device = resolve_device(EMBED_DEVICE)
-            print(f"Loading embedding model on {embed_device}...")
-            _embed_model = HuggingFaceEmbedding(
-                model_name=EMBED_MODEL_PATH,
-                device=embed_device,
-            )
-            if embed_device.startswith("cuda") and SEARCH_FP16:
-                _embed_model._model.half()
-                torch.cuda.empty_cache()  # give the freed fp32 copy back (room for the safety models)
+            print(f"Loading embedding model on {resolve_device(EMBED_DEVICE)}...")
+            _embed_model = embedding.load(EMBED_DEVICE, fp16=SEARCH_FP16)
         return _embed_model
 
 
@@ -190,36 +169,6 @@ def get_reranker():
             print("Loading reranker...")
             _reranker = build_reranker(RERANK_TOP_N)
         return _reranker
-
-
-def get_retriever():
-    """Vector retriever over the live Qdrant collection (alias QDRANT_COLLECTION)."""
-    global _retriever
-
-    with _load_lock:
-        _refresh_if_index_changed()
-        if _retriever is None:
-            print("Connecting to Qdrant...")
-            client = QdrantClient(
-                url=QDRANT_URL,
-                timeout=QDRANT_TIMEOUT,
-            )
-            if not _collection_available(client):
-                raise IndexNotReady(f"Qdrant collection '{QDRANT_COLLECTION}' not found")
-
-            vector_store = QdrantVectorStore(
-                client=client,
-                collection_name=QDRANT_COLLECTION,
-            )
-            # Nodes (text + metadata) live in the Qdrant payload, so no local
-            # docstore is needed.
-            index = VectorStoreIndex.from_vector_store(
-                vector_store,
-                embed_model=get_embed_model(),
-            )
-            _retriever = index.as_retriever(similarity_top_k=VECTOR_TOP_K)
-
-        return _retriever
 
 
 def models_loaded() -> bool:
@@ -243,8 +192,8 @@ def preload():
     """Background start-up: load the models and the index so the first question does not wait."""
     try:
         load_models()
-        get_bm25()
-        get_retriever()
+        hybrid_query("warm-up")
+        warm_up_index()
         print("Models and index loaded.")
     except IndexNotReady as exc:
         print(f"Models loaded; no search index yet ({exc}).")
@@ -262,8 +211,9 @@ def index_info() -> dict:
             "chunks": meta.get("chunks"),
             "built_at": meta.get("built_at"),
             "sources": [s.get("name") for s in meta.get("sources") or []],
+            "legacy": meta.get("layout") != "dense+bm25",
         }
-    return {"ready": os.path.exists(BM25_PATH), "legacy": os.path.exists(BM25_PATH)}
+    return {"ready": False}
 
 
 def build_reranker(top_n: int):
@@ -301,80 +251,73 @@ def score_pairs(pairs):
 # =====================================================
 
 def hybrid_query(question, top_k=None):
-    if top_k is None:
-        top_k = HYBRID_TOP_K
-
-    retriever = get_retriever()
-    reranker = get_reranker()
-
-    # 1. Vector retrieval, reranked to RERANK_TOP_N.
+    """
+    Best papers for `question`: vector search and keyword (BM25) search run
+    in Qdrant and are fused by reciprocal rank; the top_k distinct papers
+    are reranked by the cross-encoder (scores 0..1, at most RERANK_TOP_N).
+    """
+    nodes = _candidates(question, top_k or HYBRID_TOP_K)
     with _model_lock:
-        vector_nodes = reranker.postprocess_nodes(
-            retriever.retrieve(question),
-            query_str=question,
-        )
+        return get_reranker().postprocess_nodes(nodes, query_str=question)
 
-    # 2. BM25 retrieval
-    bm25_index, bm25_docs = get_bm25()
-    tokenized_query = question.lower().split()
-    bm25_scores = bm25_index.get_scores(tokenized_query)
-    bm25_top_idx = bm25_scores.argsort()[-30:][::-1]
 
-    # 3. Reciprocal Rank Fusion
-    rrf_k = 60
-    fused = {}
+# Varied questions that page the index into memory after a start or a new
+# index; the first searches on a cold index read from disk and take seconds.
+WARM_UP_QUESTIONS = [
+    "deep learning methods for image classification", "climate change effects on agriculture",
+    "lithium-ion battery degradation", "public health interventions for obesity",
+    "supply chain management and resilience", "corrosion of steel in acidic solutions",
+    "remote work and employee productivity", "cancer immunotherapy clinical outcomes",
+    "graphene composites for energy storage", "consumer behaviour in online retail",
+    "fault detection in electric motors", "water treatment by membrane filtration",
+    "language learning in higher education", "concrete compressive strength prediction",
+    "gut microbiota and metabolic disease", "renewable energy policy and economics",
+]
 
-    for rank, node in enumerate(vector_nodes):
-        md = node.node.metadata or {}
-        key = md.get("doi") or node.node.node_id
 
-        if key not in fused:
-            fused[key] = {
-                "node": node.node,
-                "score": 0.0,
-            }
+def warm_up_index():
+    started = time.time()
+    try:
+        for question in WARM_UP_QUESTIONS:
+            _candidates(question, HYBRID_TOP_K)
+        print(f"Search index warmed up in {time.time() - started:.0f}s.")
+    except Exception as exc:
+        print(f"⚠️ Index warm-up stopped: {exc}")
 
-        fused[key]["score"] += 1.0 / (rrf_k + rank + 1)
 
-    for rank, idx in enumerate(bm25_top_idx):
-        doc = bm25_docs[idx]
-        md = doc["metadata"]
-        key = md.get("doi") or doc.get("node_id") or f"bm25_{idx}"
+def _candidates(question, top_k):
+    """The top_k distinct papers of the fused vector + keyword search (before reranking)."""
+    client = get_qdrant()
+    legacy = _index_is_legacy()
 
-        if key not in fused:
-            fused[key] = {
-                "node": TextNode(
-                    text=doc["text"],
-                    metadata=md,
-                    # Same as at ingest time: "source" is not part of the text.
-                    excluded_embed_metadata_keys=["source"],
-                    excluded_llm_metadata_keys=["source"],
-                ),
-                "score": 0.0,
-            }
-
-        fused[key]["score"] += 1.0 / (rrf_k + rank + 1)
-
-    fused_list = sorted(
-        fused.values(),
-        key=lambda x: x["score"],
-        reverse=True,
-    )[:top_k]
-
-    nodes = [
-        NodeWithScore(node=item["node"], score=item["score"])
-        for item in fused_list
-    ]
-
-    # 4. Cross-encoder rerank (cached model; returns at most RERANK_TOP_N,
-    #    scores 0..1)
     with _model_lock:
-        reranked_nodes = reranker.postprocess_nodes(
-            nodes,
-            query_str=question,
-        )
+        dense = embedding.embed_query(get_embed_model(), question, legacy=legacy)
+    # Several chunks of one paper may match: ask for a few more and keep one
+    # per paper (each extra point is one more text read from disk).
+    limit = top_k + top_k // 2
+    if legacy:
+        points = client.query_points(QDRANT_COLLECTION, query=dense, limit=limit, with_payload=True).points
+    else:
+        prefetch = [qmodels.Prefetch(query=dense, using=paper_index.DENSE, limit=VECTOR_TOP_K)]
+        indices, values = paper_index.sparse_query(question)
+        if indices:
+            prefetch.append(qmodels.Prefetch(query=qmodels.SparseVector(indices=indices, values=values),
+                                             using=paper_index.SPARSE, limit=BM25_TOP_K))
+        points = client.query_points(QDRANT_COLLECTION, prefetch=prefetch,
+                                     query=qmodels.FusionQuery(fusion=qmodels.Fusion.RRF),
+                                     limit=limit, with_payload=True).points
 
-    return reranked_nodes
+    nodes, papers = [], set()
+    for point in points:
+        text, metadata = paper_index.payload_text_and_metadata(point.payload or {})
+        key = paper_index.paper_key(metadata.get("doi"), metadata.get("title"))
+        if key in papers:
+            continue
+        papers.add(key)
+        nodes.append(NodeWithScore(node=TextNode(text=text, metadata=metadata), score=point.score))
+        if len(nodes) >= top_k:
+            break
+    return nodes
 
 
 # =====================================================

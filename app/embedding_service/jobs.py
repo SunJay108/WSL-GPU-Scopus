@@ -71,10 +71,10 @@ class Job:
         return round(100.0 * progress / total_weight, 1)
 
     def eta_seconds(self):
-        """Rough ETA, driven by the embedding stage which dominates the runtime."""
-        if self.state != "running" or self.stage != "embed":
+        """Rough ETA, driven by the indexing stage (read, embed, upload) which dominates the runtime."""
+        if self.state != "running" or self.stage != "index":
             return None
-        s = self.stage_entry("embed")
+        s = self.stage_entry("index")
         if not s["total"] or not s["done"] or not s["started_at"]:
             return None
         rate = s["done"] / max(time.time() - s["started_at"], 1e-6)
