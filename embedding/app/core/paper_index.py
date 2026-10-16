@@ -1,6 +1,7 @@
 """
-The paper index in Qdrant, shared by the embedding service (writes it) and
-the search service (reads it).
+The paper index in Qdrant: the embedding app writes it, the search app reads
+it.  Both apps have a copy of this file; the copies must stay identical (the
+search app refuses bundles whose INDEX_FORMAT differs from its own).
 
 One point per chunk of a paper, with two vectors:
   dense   multilingual-e5-small embedding (meaning)
@@ -12,8 +13,8 @@ Payload: text (the passage shown to the language model), title, doi, year,
 journal, source, paper (one key per paper), chunk, batch (ingest run).
 
 Collections built before this layout (one unnamed vector, llama-index
-payload) are "legacy": the search service can still query them (dense only)
-until the next Replace ingest rebuilds the index.
+payload) are "legacy": the search app can still query them (dense only)
+until a new index is imported.
 """
 
 import json

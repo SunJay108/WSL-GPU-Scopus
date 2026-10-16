@@ -1,0 +1,13 @@
+models/
+qdrant_data/
+bundles/
+app/data/
+*.tar
+*.tar.gz
+*.zip
+.git/
+__pycache__/
+*.pyc
+third_party/llama.cpp-*/
+loadtest_results/
+!third_party/llama.cpp-*.tar.gz

@@ -1,0 +1,140 @@
+# Scopus AI search app.  The index is built by the embedding app (../embedding,
+# on its own PC) and imported from a bundle: admin panel > Index, or
+# docker exec -it scopus-ai-gpu python import_index.py NAME
+#
+# Services
+#   qdrant     vector database holding the imported index            (port 6333)
+#   llm        language model server (llama.cpp), used by scopus-ai  (internal)
+#   scopus-ai  Scopus search UI                                      http://localhost:7860
+
+# Same project name wherever the folder is: containers and volumes keep their names.
+name: scopus
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: scopus-qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    # RocksDB keeps many files open; the default soft limit (1024) makes Qdrant
+    # panic with "Too many open files" while it holds two indexes (import).
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant_data:/qdrant/storage
+      # Bundles from the embedding PC: Qdrant reads the snapshot from here.
+      - ${BUNDLES_DIR:-./bundles}:/qdrant/snapshots/bundles:ro
+
+  # Language model server: one copy of the model, LLM_PARALLEL answers at the
+  # same time (continuous batching).  On a larger GPU raise LLM_PARALLEL (and
+  # use a larger model, LLM_MODEL) in .env; nothing else changes.
+  llm:
+    image: scopus-llm:b10991
+    build:
+      context: .
+      dockerfile: Dockerfile.llm
+    container_name: scopus-llm
+    restart: unless-stopped
+    gpus: all
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}
+      LLM_PARALLEL: ${LLM_PARALLEL:-1}
+      LLM_CTX: ${LLM_CTX:-4096}
+      LLM_GPU_LAYERS: ${LLM_GPU_LAYERS:-all}
+      LLM_BATCH: ${LLM_BATCH:-512}
+      LLM_THREADS: ${LLM_THREADS:-4}
+    entrypoint: ["/bin/sh", "-c"]
+    # Each slot gets LLM_CTX tokens of context.
+    command:
+      - >-
+        exec llama-server --host 0.0.0.0 --port 8080
+        --model "/models/$$LLM_MODEL"
+        --parallel "$$LLM_PARALLEL" --ctx-size "$$((LLM_CTX * LLM_PARALLEL))"
+        --n-gpu-layers "$$LLM_GPU_LAYERS" --batch-size "$$LLM_BATCH" --threads "$$LLM_THREADS"
+        --no-webui --metrics
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  scopus-ai:
+    image: scopus-ai-gpu:1.1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scopus-ai-gpu
+    restart: unless-stopped
+    command: ["python", "-m", "search_service"]
+    depends_on:
+      - qdrant
+      - llm
+    ports:
+      - "7860:7860"
+    gpus: all
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-300}
+      QDRANT_COLLECTION: papers
+      BASE_DATA_DIR: /app/app/data
+      EMBED_MODEL_PATH: /app/models/multilingual-e5-small
+      EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
+      RERANKER_PATH: /app/models/bge-reranker-base
+      RERANK_DEVICE: ${RERANK_DEVICE:-cuda}
+      # Fully offline: never try to reach Hugging Face.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      # Accounts (the first account becomes the administrator)
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
+      SESSION_DAYS: ${SESSION_DAYS:-7}
+      # Index bundles (host path shown in the admin panel)
+      BUNDLES_HOST_DIR: ${BUNDLES_DIR:-./bundles}
+
+      # Language model server (service "llm"); same LLM_PARALLEL as there
+      LLM_URL: http://llm:8080
+      LLM_PARALLEL: ${LLM_PARALLEL:-1}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.0}
+      LLM_REPEAT_PENALTY: ${LLM_REPEAT_PENALTY:-1.1}
+      LLM_TOP_P: ${LLM_TOP_P:-0.90}
+      LLM_TOP_K: ${LLM_TOP_K:-40}
+      LLM_ANSWER_TOKENS: ${LLM_ANSWER_TOKENS:-900}
+      PRELOAD_MODELS: ${PRELOAD_MODELS:-true}
+
+      # Question guard and answer quality (see app/search_service/guard.py, app/core/config.py)
+      GUARD_MODE: ${GUARD_MODE:-llm}
+      RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
+      RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}
+      ANSWER_SOURCES: ${ANSWER_SOURCES:-5}
+      # Only sentences supported by the papers are shown (app/search_service/grounding.py)
+      GROUNDING: ${GROUNDING:-true}
+      GROUNDING_MIN_SCORE: ${GROUNDING_MIN_SCORE:-0.3}
+      SUGGEST_FOLLOWUPS: ${SUGGEST_FOLLOWUPS:-true}
+      SEARCH_FP16: ${SEARCH_FP16:-true}
+
+      # Safety models (Qwen3Guard; see app/search_service/safety.py)
+      SAFETY_INPUT: ${SAFETY_INPUT:-true}
+      SAFETY_INPUT_MODEL_PATH: /app/models/Qwen3Guard-Gen-0.6B
+      SAFETY_INPUT_DEVICE: ${SAFETY_INPUT_DEVICE:-auto}
+      SAFETY_INPUT_CONTROVERSIAL: ${SAFETY_INPUT_CONTROVERSIAL:-Political,Jailbreak}
+      SAFETY_OUTPUT: ${SAFETY_OUTPUT:-true}
+      SAFETY_OUTPUT_MODEL_PATH: /app/models/Qwen3Guard-Stream-0.6B
+      SAFETY_OUTPUT_DEVICE: ${SAFETY_OUTPUT_DEVICE:-auto}
+      SAFETY_OUTPUT_CONTROVERSIAL: ${SAFETY_OUTPUT_CONTROVERSIAL:-}
+      SAFETY_OUTPUT_MIN_TOKENS: ${SAFETY_OUTPUT_MIN_TOKENS:-2}
+
+    volumes:
+      # IMPORTANT: bind-mount the whole app directory so Python/UI changes
+      # take effect without rebuilding the 20+ GB GPU image.
+      - ./app:/app/app
+      - ./models:/app/models:ro
+      # Bundles from the embedding PC (checked here, deleted from the admin panel).
+      - ${BUNDLES_DIR:-./bundles}:/bundles
+      - /etc/localtime:/etc/localtime:ro

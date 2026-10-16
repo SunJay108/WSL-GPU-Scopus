@@ -1,0 +1,17 @@
+llama-index==0.12.8
+llama-index-vector-stores-qdrant==0.4.0
+llama-index-embeddings-huggingface==0.4.0
+llama-index-llms-llama-cpp==0.4.0
+qdrant-client==1.12.1
+sentence-transformers
+transformers
+torch
+numpy==1.26.4
+scikit-learn==1.5.2
+rispy
+fastapi
+uvicorn
+grpcio==1.68.1
+# rispy and PyMySQL are not used by the search app: the embedding app's image
+# is made from this image (embedding/Dockerfile) and reads RIS and MySQL data.
+PyMySQL==1.1.1

@@ -1,7 +1,7 @@
 # Image of the embedding service.
 #
 # The Python packages are taken from the search app's image (built from the
-# Dockerfile in the repository root), and everything the embedding service
+# search app's Dockerfile, search/Dockerfile), and everything the embedding service
 # does not use is removed (language model runtime, web UI framework, ...).
 # Both apps therefore run the very same PyTorch / sentence-transformers
 # builds and compute the same vectors.  The result is about a fifth of the

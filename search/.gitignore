@@ -1,0 +1,26 @@
+# ---- Large / licensed assets: copy them in locally (see README) ----
+models/*
+!models/PUT_MODELS_HERE.txt
+
+# Vector index (Qdrant storage)
+qdrant_data/*
+!qdrant_data/.gitkeep
+
+# Index bundles copied from the embedding PC
+bundles/*
+!bundles/.gitkeep
+
+# Accounts, chat history, index description
+app/data/*
+!app/data/storage/
+app/data/storage/*
+!app/data/storage/.gitkeep
+
+# Offline bundle
+offline_bundle/
+
+# Load test results (scripts/load_test.sh)
+loadtest_results/
+
+# llama.cpp source archive for Dockerfile.llm (scripts/get_llama_server_source.sh)
+third_party/

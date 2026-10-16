@@ -1,27 +1,11 @@
-# ---- Large / licensed assets: copy them in locally (see README) ----
-models/*
-!models/PUT_MODELS_HERE.txt
-
-# Vector index (Qdrant storage)
-qdrant_data/*
-!qdrant_data/.gitkeep
-
-# Input data, built index and job state
-app/data/*
-!app/data/storage/
-!app/data/ris_index/
-app/data/storage/*
-!app/data/storage/.gitkeep
-app/data/ris_index/*
-!app/data/ris_index/.gitkeep
-
-# Offline bundle and saved images
-offline_bundle/
-*.tar
-*.tar.gz
+# Rules for both apps; search/.gitignore and embedding/.gitignore add their own.
 
 # Local settings (copy .env.example to .env)
 .env
+
+# Saved images and archives
+*.tar
+*.tar.gz
 
 # Python
 __pycache__/
@@ -31,9 +15,3 @@ __pycache__/
 *Zone.Identifier
 Thumbs.db
 desktop.ini
-
-# Load test results (scripts/load_test.sh)
-loadtest_results/
-
-# llama.cpp source archive for Dockerfile.llm (scripts/get_llama_server_source.sh)
-third_party/

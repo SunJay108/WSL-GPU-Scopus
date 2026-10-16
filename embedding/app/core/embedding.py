@@ -1,6 +1,7 @@
 """
-The embedding model (multilingual-e5-small) shared by both services: the
-embedding service embeds paper passages, the search service the questions.
+The embedding model (multilingual-e5-small): the embedding app embeds paper
+passages, the search app the questions.  Both apps have a copy of this file;
+the copies must stay identical.
 
 e5 models are trained with "passage: " in front of documents and "query: "
 in front of questions; indexes built before these prefixes were used

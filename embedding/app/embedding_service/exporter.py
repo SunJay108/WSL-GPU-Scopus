@@ -34,9 +34,12 @@ README = """Scopus AI search index bundle
 Created by the embedding service on {created_at}.
 Index version {version}: {papers:,} papers, {chunks:,} chunks, format {format}.
 
-Copy this whole folder to the search PC and import it with the search app
-(see the search app's README).  Do not change or rename the files: the
-search app checks them against manifest.json (SHA-256) before importing.
+Copy this whole folder into the bundles folder of the search app on the
+search PC (search/bundles by default), then import it there: admin panel >
+Index > Import, or
+  docker exec -it scopus-ai-gpu python import_index.py {name}
+Do not change or rename the files: the search app checks them against
+manifest.json (SHA-256) before importing.
 
 To check a copy yourself:
   Linux / WSL:  sha256sum -c SHA256SUMS
@@ -161,7 +164,7 @@ def export_bundle(report, username=""):
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(os.path.join(partial, "README.txt"), "w", encoding="utf-8") as f:
             f.write(README.format(created_at=created_at, version=meta["version"], papers=meta.get("papers") or 0,
-                                  chunks=meta.get("chunks") or points, format=meta["format"]))
+                                  chunks=meta.get("chunks") or points, format=meta["format"], name=name))
         with open(os.path.join(partial, "SHA256SUMS"), "w", encoding="utf-8") as f:
             f.writelines(f"{info['sha256']}  {name}\n" for name, info in files.items())
         manifest = {

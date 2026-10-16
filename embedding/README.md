@@ -42,13 +42,13 @@ thing that moves between the two is the bundle folder.
 ## Set-up (PC with internet access)
 
 The image reuses the Python packages of the search app's image
-(`scopus-ai-gpu:1.1`, built from the repository root), so both compute the same
+(`scopus-ai-gpu:1.1`, built from `search/Dockerfile`), so both compute the same
 vectors and no download is needed:
 
 ```bash
 cd embedding
 cp .env.example .env                                     # adjust IMPORT_DIR etc.
-cp -r ../models/multilingual-e5-small models/            # see models/PUT_MODELS_HERE.txt
+cp -r ../search/models/multilingual-e5-small models/     # see models/PUT_MODELS_HERE.txt
 docker compose build                                     # scopus-embedding:1.0
 docker compose up -d
 scripts/check_gpu.sh                                     # GPU visible, embedding speed
@@ -89,7 +89,10 @@ docker compose up -d
    and vector search; both should find almost all of them (a warning is shown
    below 80 %). The result is shown in the index card.
 4. **Export for the search app** – writes a bundle into `EXPORT_DIR`. Copy the
-   whole bundle folder to the search PC and import it there.
+   whole bundle folder into the search app's bundles folder on the search PC
+   (`search/bundles` by default) and import it there: admin panel › **Index** ›
+   **Import**, or `docker exec -it scopus-ai-gpu python import_index.py <bundle>`
+   (see [search/README.md](../search/README.md)).
 
 An ingest and an export never run at the same time.
 
