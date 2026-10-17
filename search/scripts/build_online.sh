@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
+# Build both images of the search app from the Dockerfile (needs Internet; no existing
+# image is used) and start the stack.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cp -n .env.example .env 2>/dev/null || true
 
-echo 'Building the GPU image of the search app (the embedding app builds its image from it)...'
-docker compose build --no-cache scopus-ai
-
-echo 'Building the language model server (llama.cpp) and pulling Qdrant...'
-docker pull qdrant/qdrant:v1.12.6
+echo 'Downloading the llama.cpp source archive...'
 ./scripts/get_llama_server_source.sh
-docker compose build llm
+
+echo 'Building scopus-llm:b10991 and scopus-ai-gpu:1.1 (about 45 minutes)...'
+docker compose build
+
+echo 'Pulling Qdrant...'
+docker pull qdrant/qdrant:v1.12.6
 
 echo 'Starting stack...'
 docker compose up -d
 
 echo 'Done.'
-echo '  Import an index bundle: admin panel > Index (bundles from the embedding app in ./bundles)'
 echo '  Scopus search UI:  http://localhost:7860'
+echo '  Import an index bundle: admin panel > Index (bundles from the embedding app in ./bundles)'
+echo '  The embedding app can now be built: cd ../embedding && docker compose build'

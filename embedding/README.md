@@ -60,6 +60,13 @@ further sign-ups are off (`ALLOW_SIGNUP=false`). More administrators:
 
 ## Moving it to the offline embedding PC
 
+The usual way is the embedding package: a WSL Ubuntu with Docker, the NVIDIA
+Container Toolkit, the images and this app, made by `offline/make_packages.ps1`
+– see [`Deploy-GPU-Project-Offline.md`](../Deploy-GPU-Project-Offline.md).
+
+If the offline PC already has Docker Engine and the NVIDIA Container Toolkit,
+the images and this folder are enough:
+
 ```bash
 scripts/save_images.sh        # on the online PC: images/scopus-embedding-images.tar
 ```

@@ -1,17 +1,31 @@
-llama-index==0.12.8
-llama-index-vector-stores-qdrant==0.4.0
-llama-index-embeddings-huggingface==0.4.0
-llama-index-llms-llama-cpp==0.4.0
-qdrant-client==1.12.1
-sentence-transformers
-transformers
-torch
-numpy==1.26.4
+# Python packages of the search app's image (Dockerfile, target app), pinned to the
+# versions tested together.  PyTorch 2.14.1 comes from PyTorch's index (its CUDA 13.0
+# packages are no longer all on PyPI); the NVIDIA driver must support CUDA 13.0 (580+).
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1
+sentence-transformers==6.1.0
+transformers==5.19.0
+tokenizers==0.23.2
+huggingface_hub==1.33.0
+safetensors==0.8.0
+numpy==2.5.3
+scipy==1.17.1
 scikit-learn==1.5.2
-rispy
-fastapi
-uvicorn
+
+# Reranker wrapper and result nodes (search_service/query.py)
+llama-index-core==0.12.52.post1
+
+qdrant-client==1.12.1
 grpcio==1.68.1
-# rispy and PyMySQL are not used by the search app: the embedding app's image
-# is made from this image (embedding/Dockerfile) and reads RIS and MySQL data.
+grpcio-tools==1.68.1
+protobuf==5.29.6
+
+fastapi==0.143.0
+starlette==0.52.1
+pydantic==2.14.0
+uvicorn==0.54.0
+
+# Not used by the search app: the embedding app's image is made from this image
+# (../embedding/Dockerfile) and reads RIS files and MySQL tables with them.
 PyMySQL==1.1.1
+rispy==0.10.0

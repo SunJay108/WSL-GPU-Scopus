@@ -37,7 +37,7 @@ services:
     image: scopus-llm:b10991
     build:
       context: .
-      dockerfile: Dockerfile.llm
+      target: llm
     container_name: scopus-llm
     restart: unless-stopped
     gpus: all
@@ -70,7 +70,7 @@ services:
     image: scopus-ai-gpu:1.1
     build:
       context: .
-      dockerfile: Dockerfile
+      target: app
     container_name: scopus-ai-gpu
     restart: unless-stopped
     command: ["python", "-m", "search_service"]

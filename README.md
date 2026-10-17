@@ -28,7 +28,17 @@ embedding model: `app/core/paper_index.py` and `app/core/embedding.py` are the s
 and `INDEX_FORMAT` in `paper_index.py` names the layout. The search app refuses bundles of another
 format or model.
 
-Both apps are built online first and then moved to offline PCs; see `search/README.md`,
-`search/Deploy-GPU-Project-Offline.md` and `embedding/README.md`. The embedding app's image is made
-from the search app's image (same Python packages, so both compute identical vectors): build
-`search` first.
+Both apps are built and tested online, then moved to the offline PCs as two WSL packages (Ubuntu with
+Docker, the images and one app each): [`Deploy-GPU-Project-Offline.md`](Deploy-GPU-Project-Offline.md)
+explains how to make them (`offline/make_packages.ps1`) and how to install them.
+
+All images can be built from zero: `search/Dockerfile` (targets `llm` and `app`), then
+`embedding/Dockerfile`, which is made from the search app's image (same Python packages, so both
+compute identical vectors).
+
+| Path | |
+|---|---|
+| `embedding/` | embedding app ([README](embedding/README.md)) |
+| `search/` | search app ([README](search/README.md)) |
+| `offline/` | scripts and guides for the two offline packages |
+| `Deploy-GPU-Project-Offline.md` | offline deployment of both PCs |

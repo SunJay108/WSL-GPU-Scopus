@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Download the llama.cpp source archive used by Dockerfile.llm (online PC only).
+# Download the llama.cpp source archive used by the Dockerfile (target llm; online PC only).
 # Resumes interrupted downloads, so it also works on a slow or unstable line.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION=$(sed -n 's/^ARG LLAMA_CPP_VERSION=//p' Dockerfile.llm)
+VERSION=$(sed -n "s/^ARG LLAMA_CPP_VERSION=//p" Dockerfile)
 FILE="third_party/llama.cpp-${VERSION}.tar.gz"
 mkdir -p third_party
 

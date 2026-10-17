@@ -24,8 +24,9 @@ snapshot + checksums), which an administrator imports in the admin panel.
 
 - The images are built on an **online** PC; the result is copied to a **fully offline** PC.
 - Docker Engine in WSL2 (Docker Desktop not required), NVIDIA Container Toolkit, NVIDIA Windows driver.
-- Images: `scopus-ai-gpu:1.1` (search UI), `scopus-llm:b10991` (llama.cpp server, built from
-  `Dockerfile.llm` on top of the app image), `qdrant/qdrant:v1.12.6`.
+- Images: `scopus-ai-gpu:1.1` (search UI) and `scopus-llm:b10991` (llama.cpp server), both built
+  from the one `Dockerfile` (targets `app` and `llm`) on public base images only, and
+  `qdrant/qdrant:v1.12.6`.
 - Models are mounted from `./models`, the index lives in `./qdrant_data` (+ `app/data/storage/index_meta.json`).
 
 ## 1. Project layout
@@ -62,13 +63,11 @@ snapshot + checksums), which an administrator imports in the admin panel.
 ├── bundles/                    index bundles copied from the embedding PC (BUNDLES_DIR)
 ├── models/
 ├── qdrant_data/
-├── scripts/                    build, upgrade, export/import offline bundle, GPU check, load test,
+├── scripts/                    build, export/import offline bundle, GPU check, load test,
 │                               safety model download
 ├── .env / .env.example
-├── Dockerfile                  full image build
-├── Dockerfile.upgrade          quick 1.0 → 1.1 image upgrade
-├── Dockerfile.llm              language model server (llama.cpp llama-server) on the app image
-├── third_party/                llama.cpp source archive for Dockerfile.llm (downloaded, not in git)
+├── Dockerfile                  both images: target app (search UI), target llm (llama.cpp llama-server)
+├── third_party/                llama.cpp source archive for the llm target (downloaded, not in git)
 ├── docker-compose.yml
 └── requirements.txt
 ```
@@ -141,16 +140,20 @@ chmod +x scripts/*.sh
 ./scripts/build_online.sh
 ```
 
-This builds `scopus-ai-gpu:1.1`, downloads the llama.cpp source and builds the language model server
-`scopus-llm` on top of it (about 30 minutes; CUDA kernels for RTX 20xx/30xx/40xx), pulls Qdrant, and
-starts the three containers. The embedding app's image is made from `scopus-ai-gpu:1.1` as well
-(`../embedding/Dockerfile`), so build this one first.
+This downloads the llama.cpp source (`scripts/get_llama_server_source.sh`, resumes broken downloads)
+and builds both images from the `Dockerfile` with `docker compose build`, starting from public base
+images only – no existing local image is needed:
 
-If `scopus-ai-gpu:1.0` already exists, `./scripts/upgrade_image.sh` is much faster: it builds 1.1 on
-top of 1.0 (`Dockerfile.upgrade`: adds PyMySQL and recompiles llama.cpp for RTX 20xx–40xx GPUs),
-reusing all other layers.
+| Target | Image | Contents |
+|---|---|---|
+| `llm` | `scopus-llm:b10991` | llama.cpp `llama-server`, compiled in `nvidia/cuda:12.6.3-devel` for RTX 20xx/30xx/40xx (+ PTX), run on `nvidia/cuda:12.6.3-runtime` |
+| `app` | `scopus-ai-gpu:1.1` | Ubuntu 24.04, Python venv with the packages of `requirements.txt` (PyTorch 2.14.1 with its own CUDA 13.0 libraries) |
 
-For a fully offline PC, export the whole WSL distro – see `Deploy-GPU-Project-Offline.md`.
+Then it pulls Qdrant and starts the three containers. The packages in `requirements.txt` are pinned to
+the tested versions; pip resumes interrupted downloads (`PIP_RESUME_RETRIES`). The embedding app's
+image is made from `scopus-ai-gpu:1.1` (`../embedding/Dockerfile`), so build this one first.
+
+For the fully offline PCs see `../Deploy-GPU-Project-Offline.md`.
 
 ## 6. Import the index
 
@@ -406,6 +409,10 @@ curl -s http://localhost:7860/api/health   # search UI ready? (models, language 
 
 ## 11. Create the fully-offline bundle
 
+The usual way to an offline PC is a WSL package (Ubuntu with Docker, the NVIDIA Container
+Toolkit, the images and the app): see `../Deploy-GPU-Project-Offline.md`. The bundle below is
+for an offline PC that already has Docker Engine and the NVIDIA Container Toolkit.
+
 After the online build has been tested:
 
 ```bash
@@ -455,7 +462,7 @@ vmIdleTimeout=-1
 instanceIdleTimeout=-1
 ```
 
-and run `wsl --shutdown` once (see section 12 of `Deploy-GPU-Project-Offline.md`).
+and run `wsl --shutdown` once (see `../Deploy-GPU-Project-Offline.md`).
 
 ## 13. Notes
 
