@@ -3,7 +3,7 @@
 # the search app (own Qdrant, own accounts, own data folders).
 #
 # Services
-#   qdrant     vector database holding the index          (internal only)
+#   qdrant     vector database holding the index          http://localhost:6343/dashboard
 #   mariadb    reads the MySQL MyISAM files during an ingest (internal only)
 #   embedding  web UI + ingest + export                    http://localhost:7861
 
@@ -27,6 +27,10 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+    # Dashboard and REST API for checks, on this PC only.  Not 6333: that is
+    # the search app's Qdrant when both apps run on one PC.
+    ports:
+      - "127.0.0.1:${EMBED_QDRANT_PORT:-6343}:6333"
     volumes:
       - ./data/qdrant:/qdrant/storage
       - ${EXPORT_DIR:-./data/exports}/.snapshots:/qdrant/snapshots

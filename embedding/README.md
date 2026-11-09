@@ -170,6 +170,7 @@ An SSD speeds up staging the MySQL tables, Qdrant and the export.
 | `IMPORT_DIR` | `./data/import` | folder tree the UI can browse |
 | `EXPORT_DIR` | `./data/exports` | export bundles; keep it on a Linux disk |
 | `EMBED_SERVICE_BIND` / `EMBED_SERVICE_PORT` | `127.0.0.1` / `7861` | `0.0.0.0` = reachable from the network |
+| `EMBED_QDRANT_PORT` | `6343` | Qdrant dashboard `http://localhost:6343/dashboard` (this PC only) |
 | `EMBED_DEVICE` | `cuda` | `cpu` to embed without a GPU |
 | `EMBED_BATCH_SIZE` | `128` | chunks per GPU batch (halved on out-of-memory) |
 | `EMBED_FP16` | `true` | half precision on the GPU |
