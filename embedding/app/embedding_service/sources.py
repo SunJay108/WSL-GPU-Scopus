@@ -47,6 +47,12 @@ FIELD_COLUMNS = {
 # MyISAM "table is crashed / needs repair" error codes.
 _CRASHED_ERRORS = {126, 127, 134, 144, 145, 1034, 1194, 1195}
 
+# Rows are streamed while each batch is embedded and uploaded.  MariaDB drops a
+# stream that the client has not read from for net_write_timeout seconds
+# (default 60) - e.g. while embedding on the CPU or waiting for Qdrant - so the
+# reading session gets a long one.  Cancel still stops the query (KILL QUERY).
+_STREAM_WRITE_TIMEOUT = 24 * 3600
+
 _TAG_RE = re.compile(r"</?(?:jats:|mml:)?[A-Za-z]+(?:\s+[A-Za-z_:.-]+\s*=\s*\"[^\"]*\")*\s*/?>")
 _SPACE_RE = re.compile(r"\s+")
 _YEAR_RE = re.compile(r"\b(1[5-9]\d\d|2[01]\d\d)\b")
@@ -393,6 +399,7 @@ class MariaDBStaging:
 
         with mariadb_connect(self.database) as conn:
             with conn.cursor() as cur:
+                cur.execute(f"SET SESSION net_write_timeout = {_STREAM_WRITE_TIMEOUT}")
                 cur.execute(f"SHOW COLUMNS FROM {_quote(name)}")
                 columns = [row[0] for row in cur.fetchall()]
 
@@ -425,7 +432,10 @@ class MariaDBStaging:
             finished = False
             try:
                 while True:
-                    rows = cur.fetchmany(2000)
+                    try:
+                        rows = cur.fetchmany(2000)
+                    except pymysql.err.MySQLError as exc:
+                        raise IngestError(f"Reading table '{stem}' failed: {exc.args[-1]}") from exc
                     if not rows:
                         break
                     for row in rows:
@@ -439,8 +449,12 @@ class MariaDBStaging:
                     self._kill_query(conn.thread_id())
                 try:
                     cur.close()
-                except pymysql.err.MySQLError:
-                    pass                      # "query execution was interrupted"
+                except Exception:
+                    # "query execution was interrupted", or the connection is
+                    # already gone (pymysql then raises AttributeError:
+                    # 'NoneType' object has no attribute 'settimeout').  The
+                    # error that stopped the read is the one to report.
+                    pass
 
     def _kill_query(self, thread_id):
         try:
