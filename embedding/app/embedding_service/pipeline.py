@@ -295,14 +295,23 @@ def run_ingest(folder, tables=None, include_ris=True, mode="append",
 # Steps
 # =====================================================
 
+# Points per request when reading the current index.  Qdrant reads each point's whole
+# payload (with the passage text) from disk and gives up on a read after 60 s unless the
+# request allows longer: on a hard disk 10,000 points per request took more than that.
+SCROLL_PAGE = 1000
+
+
 def indexed_papers(client, collection, rep):
     """Keys of the papers in `collection` (read page by page; only the key field)."""
     seen, offset = set(), None
     total = with_qdrant_retry(lambda: client.get_collection(collection).points_count, rep) or 0
+    # Qdrant's own limit per request, below the HTTP timeout of the client.
+    page_timeout = max(60, QDRANT_TIMEOUT - 30)
     done = 0
     while True:
         points, offset = with_qdrant_retry(lambda: client.scroll(
-            collection, limit=10000, offset=offset, with_payload=["paper"], with_vectors=False), rep)
+            collection, limit=SCROLL_PAGE, offset=offset, with_payload=["paper"], with_vectors=False,
+            timeout=page_timeout), rep)
         for p in points:
             seen.add(p.payload.get("paper"))
         done += len(points)
