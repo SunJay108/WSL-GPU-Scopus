@@ -7,9 +7,12 @@ cannot break the application.
 import os
 
 
+# An empty value (docker-compose.yml passes ${NAME:-} for settings that are
+# unset in .env) means "not set": the default applies.
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
         return int(raw.strip())
@@ -20,7 +23,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
         return float(raw.strip())
@@ -111,34 +114,74 @@ LLM_REPEAT_PENALTY = _clamp(_env_float("LLM_REPEAT_PENALTY", 1.1), 1.0, 1.5)
 LLM_TOP_P = _clamp(_env_float("LLM_TOP_P", 0.90), 0.05, 1.0)
 LLM_TOP_K = _clamp(_env_int("LLM_TOP_K", 40), 1, 200)
 
-# Longest answer (tokens, about 4 characters each) and summary.
-LLM_ANSWER_TOKENS = _clamp(_env_int("LLM_ANSWER_TOKENS", 900), 200, 4096)
-SUMMARY_MAX_TOKENS = _clamp(_env_int("SUMMARY_MAX_TOKENS", 220), 60, 600)
+# How much an answer says: ANSWER_DETAIL picks a level, which sets how many
+# papers the answer is written from, how long it and its summary are asked to
+# be, and their token limits (tokens are about 4 characters).  More needs more
+# context per answer (LLM_CTX, GPU memory for the llm service) and more time;
+# README section 8 lists the level for each GPU.  ANSWER_SOURCES,
+# LLM_ANSWER_TOKENS and SUMMARY_MAX_TOKENS in .env override single values.
+# Whatever the level, an answer never asks for more context than the model
+# server has (query.py drops the weakest papers or shortens the answer).
+# Measured with the 3B model: a paragraph range works better than asking for
+# content per paper (which gave one short paragraph), and "fewer paragraphs
+# with fewer sources" keeps it from declining a question one paper answers.
+ANSWER_LEVELS = {
+    "standard": dict(
+        papers=5, answer_tokens=900, summary_tokens=220, summary="two to four",
+        answer="Cover the relevant findings of every source that addresses the question, in two to four "
+               "paragraphs (or a list)"),
+    "detailed": dict(
+        papers=6, answer_tokens=1200, summary_tokens=300, summary="three to five",
+        answer="Cover the relevant findings of every source that addresses the question in detail, in three "
+               "to five paragraphs (or a list); with only one or two such sources, write fewer paragraphs"),
+    "max": dict(
+        papers=8, answer_tokens=1600, summary_tokens=400, summary="four to six",
+        answer="Cover the relevant findings, methods and results of every source that addresses the question "
+               "in detail, in four to six paragraphs (or a list); with only one or two such sources, write "
+               "fewer paragraphs"),
+}
+ANSWER_DETAIL = (os.getenv("ANSWER_DETAIL") or "standard").strip().lower()
+if ANSWER_DETAIL not in ANSWER_LEVELS:
+    print(f"⚠️ Invalid ANSWER_DETAIL={ANSWER_DETAIL!r}; using standard")
+    ANSWER_DETAIL = "standard"
+_LEVEL = ANSWER_LEVELS[ANSWER_DETAIL]
+ANSWER_INSTRUCTION = _LEVEL["answer"]          # used in the answer prompt (query.py)
+SUMMARY_SENTENCES = _LEVEL["summary"]          # "two to four" sentences
+_LEVEL_SOURCES, _LEVEL_ANSWER_TOKENS, _LEVEL_SUMMARY_TOKENS = (
+    _LEVEL["papers"], _LEVEL["answer_tokens"], _LEVEL["summary_tokens"])
+
+# Longest answer and summary (tokens).
+LLM_ANSWER_TOKENS = _clamp(_env_int("LLM_ANSWER_TOKENS", _LEVEL_ANSWER_TOKENS), 200, 4096)
+SUMMARY_MAX_TOKENS = _clamp(_env_int("SUMMARY_MAX_TOKENS", _LEVEL_SUMMARY_TOKENS), 60, 600)
 
 
 # =====================================================
 # Search service: retrieval, guard, chat
 # =====================================================
 
+# Papers the answer is written from (at most; see SOURCE_MIN_SCORE below).
+# Only the papers the answer cites are listed under it as references.
+ANSWER_SOURCES = _clamp(_env_int("ANSWER_SOURCES", _LEVEL_SOURCES), 1, 10)
+
 # Candidates from the vector search and from the keyword (BM25) search, fused
 # by reciprocal rank in Qdrant; the best HYBRID_TOP_K papers go to the
-# cross-encoder, which keeps RERANK_TOP_N.
+# cross-encoder, which keeps RERANK_TOP_N (at least ANSWER_SOURCES).
 VECTOR_TOP_K = _clamp(_env_int("VECTOR_TOP_K", 30), 4, 100)
 BM25_TOP_K = _clamp(_env_int("BM25_TOP_K", 30), 4, 100)
 HYBRID_TOP_K = _clamp(_env_int("HYBRID_TOP_K", 20), 4, 50)
-RERANK_TOP_N = _clamp(_env_int("RERANK_TOP_N", 5), 1, 20)
+RERANK_TOP_N = max(_clamp(_env_int("RERANK_TOP_N", ANSWER_SOURCES), 1, 20), ANSWER_SOURCES)
 
 # Reranker scores are 0..1 (measured: questions the index covers score
 # 0.5-1.0, topics with only related papers ~0.15, unrelated questions <0.07).
 # Best paper below RELEVANCE_MIN_SCORE: declined ("no relevant papers") instead
 # of answering from unrelated sources.  Below RELEVANCE_WARN_SCORE: answered
 # with a notice that only loosely related papers were found.  Papers below
-# SOURCE_MIN_SCORE are left out of the answer context and the references.
+# SOURCE_MIN_SCORE are not given to the model (at 0.05, papers on another
+# topic that only share a word, e.g. "molecular motor" for "motor drives",
+# still got in).
 RELEVANCE_MIN_SCORE = _clamp(_env_float("RELEVANCE_MIN_SCORE", 0.1), 0.0, 1.0)
 RELEVANCE_WARN_SCORE = _clamp(_env_float("RELEVANCE_WARN_SCORE", 0.3), 0.0, 1.0)
-SOURCE_MIN_SCORE = _clamp(_env_float("SOURCE_MIN_SCORE", 0.05), 0.0, 1.0)
-# Papers the answer is written from (= the references listed under it).
-ANSWER_SOURCES = _clamp(_env_int("ANSWER_SOURCES", 5), 1, 10)
+SOURCE_MIN_SCORE = _clamp(_env_float("SOURCE_MIN_SCORE", 0.1), 0.0, 1.0)
 
 # Every answer and summary sentence must be supported by those papers
 # (search_service/grounding.py): cross-encoder score of the sentence against

@@ -105,14 +105,20 @@ services:
       LLM_REPEAT_PENALTY: ${LLM_REPEAT_PENALTY:-1.1}
       LLM_TOP_P: ${LLM_TOP_P:-0.90}
       LLM_TOP_K: ${LLM_TOP_K:-40}
-      LLM_ANSWER_TOKENS: ${LLM_ANSWER_TOKENS:-900}
       PRELOAD_MODELS: ${PRELOAD_MODELS:-true}
+
+      # How much an answer says (standard | detailed | max; see app/core/config.py).
+      # Empty values are set by the level; a value in .env overrides it.
+      ANSWER_DETAIL: ${ANSWER_DETAIL:-standard}
+      ANSWER_SOURCES: ${ANSWER_SOURCES:-}
+      LLM_ANSWER_TOKENS: ${LLM_ANSWER_TOKENS:-}
+      SUMMARY_MAX_TOKENS: ${SUMMARY_MAX_TOKENS:-}
 
       # Question guard and answer quality (see app/search_service/guard.py, app/core/config.py)
       GUARD_MODE: ${GUARD_MODE:-llm}
       RELEVANCE_MIN_SCORE: ${RELEVANCE_MIN_SCORE:-0.1}
       RELEVANCE_WARN_SCORE: ${RELEVANCE_WARN_SCORE:-0.3}
-      ANSWER_SOURCES: ${ANSWER_SOURCES:-5}
+      SOURCE_MIN_SCORE: ${SOURCE_MIN_SCORE:-0.1}
       # Only sentences supported by the papers are shown (app/search_service/grounding.py)
       GROUNDING: ${GROUNDING:-true}
       GROUNDING_MIN_SCORE: ${GROUNDING_MIN_SCORE:-0.3}

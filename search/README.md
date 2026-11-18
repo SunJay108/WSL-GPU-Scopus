@@ -300,10 +300,14 @@ add about 0.8 s per answer (10.3 s instead of 9.5 s) and 0.5 s per refused quest
 
 The language model may only restate what the retrieved papers say (`app/search_service/grounding.py`):
 
-1. **Sources in, citations out.** The model receives the top `ANSWER_SOURCES` papers (title, year, journal,
-   abstract) as numbered sources and is told to use nothing else, to cite a source after every sentence and
-   to reply `NO_ANSWER` when the sources do not answer the question. Decoding is greedy
-   (`LLM_TEMPERATURE=0`). The references under the answer are exactly these papers.
+1. **Sources in, citations out.** The model receives up to `ANSWER_SOURCES` papers (title, year, journal,
+   abstract; the number is set by `ANSWER_DETAIL`, section 8) whose reranker score reaches
+   `SOURCE_MIN_SCORE` (0.1), as numbered sources. It is told to use nothing else, to cite a source after
+   every sentence and to reply `NO_ANSWER` when the sources do not answer the question. Decoding is greedy
+   (`LLM_TEMPERATURE=0`). The references under the answer are the papers it **cites**, numbered 1, 2, … in
+   the order they are first cited; papers the model was given but did not use are not listed.
+   (`SOURCE_MIN_SCORE=0.05` was the earlier value: papers that only share a word with the question, such
+   as "molecular motor" for "motor drives", then reach the model too.)
 2. **Every sentence is checked before it is shown**, while the answer streams:
    - the cross-encoder of the search scores the sentence against each source; the best score must reach
      `GROUNDING_MIN_SCORE`;
@@ -343,6 +347,37 @@ LLM_GPU_LAYERS=all       # all model layers on the GPU; a number (20, 15, …) i
 GPU memory on a 6 GB card: Windows ≈ 0.6 GB, language model server ≈ 2.2 GB (3B model, one slot),
 search UI ≈ 2 GB (embedding model, reranker, answer safety model; the question safety model runs on the
 CPU). The index is built on the embedding PC, so the search PC's GPU serves questions only.
+
+### Answer length (`ANSWER_DETAIL`)
+
+`ANSWER_DETAIL` in `.env` sets how much an answer says (`docker compose up -d` after a change):
+
+| Level | Papers given to the model | Answer asked for | Summary | Token limits (answer / summary) |
+|---|---|---|---|---|
+| `standard` (default) | 5 | 2–4 paragraphs | 2–4 sentences | 900 / 220 |
+| `detailed` | 6 | 3–5 paragraphs, in detail | 3–5 sentences | 1200 / 300 |
+| `max` | 8 | 4–6 paragraphs with methods and results | 4–6 sentences | 1600 / 400 |
+
+`ANSWER_SOURCES`, `LLM_ANSWER_TOKENS` and `SUMMARY_MAX_TOKENS` in `.env` override single values of the
+level. Fewer paragraphs are written when only one or two papers answer the question, and only papers
+that reach `SOURCE_MIN_SCORE` are given to the model, so the level is an upper bound.
+
+An answer never needs more context than the language model server has: before writing, the app counts
+the prompt's tokens and shortens the answer to the room left in `LLM_CTX`, leaving out the weakest papers
+if less than 400 tokens would remain. All three levels fit `LLM_CTX=4096` (8 papers ≈ 2,500 prompt
+tokens), so a level needs no extra GPU memory.
+
+| GPU | Suggested settings (only the 6 GB row is measured) |
+|---|---|
+| 6 GB (RTX 2060) | `ANSWER_DETAIL=max`, `LLM_CTX=4096`, 3B model, one slot |
+| 8–12 GB | `max`; `LLM_PARALLEL=2`–`4` for more users, or a 7B instruct model (`LLM_MODEL`) for fuller answers |
+| 16 GB or more | `max` with a 7B–14B model and `LLM_CTX=8192` (longer answers fit), `LLM_PARALLEL` as needed |
+
+Measured on the RTX 2060 (3B model, 5 questions; the server writes about 75 tokens/s, so even the
+longest answer took under 10 s to write): `standard` 439 words in all, `detailed` 427, `max` 841. With
+several matching papers `max` doubled the answer (gut microbiota: 225 → 418 words, 4 → 7 cited papers),
+but a 3B model varies from question to question: one answer was shorter at `max`. A larger model
+follows the length instruction more reliably; the GPU memory, not the level, limits the model size.
 
 ### Scaling to a larger GPU
 
@@ -412,7 +447,8 @@ writes several times faster and runs more slots, so capacity grows with both; me
 
 Keep everything on the GPU whenever it fits (an earlier test with the language model on the CPU took
 72 s per answer instead of 9 s). `SUGGEST_FOLLOWUPS=false` saves the follow-up stage (about 15 % more
-capacity). `LLM_ANSWER_TOKENS` caps the longest answer (default 900 tokens).
+capacity). `ANSWER_DETAIL` sets the length of answers ([Answer length](#answer-length-answer_detail));
+longer answers keep a slot busy longer.
 
 ## 9. Verify GPU acceleration
 
