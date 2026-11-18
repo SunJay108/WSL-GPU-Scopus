@@ -11,13 +11,31 @@ An import
   2. lets Qdrant load the snapshot into a new collection - vectors, keyword
      index and texts, nothing is rebuilt - and checks it: number of chunks,
      vector layout, one vector search and one keyword search;
-  3. switches the alias QDRANT_COLLECTION to the new collection, writes
-     index_meta.json and deletes the previous collection.
+  3. replace (default): switches the alias QDRANT_COLLECTION to the new
+     collection, writes index_meta.json and deletes the previous collection;
+     add: copies the smaller of the new collection and the current index
+     into the other one, makes that one the index and adds the bundle to
+     index_meta.json.
 
-Searches use the current index until step 3, and a failed import leaves it
-unchanged.  Meanwhile Qdrant holds both indexes (memory and disk for two).
-With low_memory the current index is deleted before step 2 instead: half the
-memory, but no search during the import and no index if the import fails.
+Replace: searches use the current index until step 3, and a failed import
+leaves it unchanged.  Meanwhile Qdrant holds both indexes (memory and disk for
+two).  With low_memory the current index is deleted before step 2 instead:
+half the memory, but no search during the import and no index if it fails.
+
+Add: point ids are made from the paper key (paper_index.point_id), so a paper
+that is already in the index is replaced by the bundle's copy, never
+duplicated, and Qdrant applies the keyword IDF at query time, so nothing else
+has to be recomputed.  Copying takes about 20 s per 1,000 chunks on a hard
+disk, so only the smaller side is copied:
+  - a bundle with fewer chunks than the index is copied into the index in use.
+    Searches find the added papers while they are copied.  A failed add takes
+    its new papers out again, but papers it was replacing can stay incomplete
+    until the bundle is added again.
+  - otherwise the index is copied into the new collection (skipping papers the
+    bundle has too), which then replaces it as in a replace: searches use the
+    current index until the switch, a failed add leaves it unchanged, and
+    Qdrant holds both meanwhile.
+Without a current index, an add is a replace.
 
 One import at a time, also between the admin panel and import_index.py.
 """
@@ -31,6 +49,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 
 from core import paper_index
 from core.config import (
@@ -160,7 +179,7 @@ def verify_checksums(path, manifest, progress=None):
 
 def list_bundles():
     """Bundles in BUNDLES_DIR, newest first, with what would prevent their import."""
-    live_version = (read_index_meta() or {}).get("version")
+    in_index = index_versions(read_index_meta())
     try:
         qdrant_version = _qdrant(timeout=5).info().version
     except Exception:
@@ -187,7 +206,7 @@ def list_bundles():
             "chunks": manifest.get("chunks"),
             "size": sum(f.get("size", 0) for f in (manifest.get("files") or {}).values()),
             "problems": problems,
-            "in_use": not problems and bool(live_version) and manifest.get("index_version") == live_version,
+            "in_use": not problems and manifest.get("index_version") in in_index,
         })
     return sorted(bundles, key=lambda b: b["created_at"] or "", reverse=True)
 
@@ -200,6 +219,13 @@ def delete_bundle(name):
 # =====================================================
 # Import
 # =====================================================
+
+# Points per request when an add copies points between collections, and
+# Qdrant's own time limit for reading one page (60 s by default; a hard disk
+# needs 6 s or more per 1,000 points with their texts).
+COPY_PAGE = 1000
+COPY_READ_TIMEOUT = 600
+
 
 def _qdrant(timeout=IMPORT_TIMEOUT):
     from qdrant_client import QdrantClient
@@ -304,86 +330,258 @@ def _remove_live_index(client, live):
         os.remove(INDEX_META_PATH)
 
 
-def import_bundle(name, low_memory=False, report=None, username=""):
-    """Import bundle `name` from BUNDLES_DIR; returns a summary.  Raises BundleError / ImportBusyError."""
-    from qdrant_client.http import models
-    from qdrant_client.http.exceptions import UnexpectedResponse
+def index_versions(meta):
+    """Index versions of the bundles in the live index: the imported one and the ones added to it."""
+    meta = meta or {}
+    versions = {meta.get("version")} | {a.get("version") for a in meta.get("added") or []}
+    versions.discard(None)
+    return versions
 
+
+def import_bundle(name, low_memory=False, report=None, username="", add=False):
+    """
+    Import bundle `name` from BUNDLES_DIR; returns a summary.  Raises BundleError / ImportBusyError.
+    add=False: the bundle replaces the current index; add=True: its papers are added to it.
+    """
     report = report or (lambda step, done=None, total=None: print(step))
     started = time.time()
     with exclusive():
-        path = bundle_path(name)
-        manifest = read_manifest(path)
-        client = _qdrant()
-        try:
-            qdrant_version = client.info().version
-        except Exception as exc:
-            raise BundleError(f"Qdrant is not reachable at {QDRANT_URL}: {exc}")
-        problems = check_manifest(manifest, qdrant_version) + check_files(path, manifest)
-        if problems:
-            raise BundleError("The bundle cannot be imported: " + "; ".join(problems) + ".")
-
-        report("Checking the files (SHA-256)…", 0, 1)
-        verify_checksums(path, manifest, lambda done, total: report("Checking the files (SHA-256)…", done, total))
-
+        path, manifest, client = _open_bundle(name, report)
         live = live_collection(client)
-        target = f"{QDRANT_COLLECTION}_{manifest['index_version']}"
-        if target == live and not low_memory:
-            raise BundleError("This index is already in use.")
-        # Collections of earlier imports or ingests that are not in use.
-        for c in client.get_collections().collections:
-            if c.name != live and re.match(rf"^{re.escape(QDRANT_COLLECTION)}_\d{{8}}_\d{{6}}$", c.name):
-                client.delete_collection(c.name)
+        if add and live:
+            summary = _add(client, name, path, manifest, live, report, username)
+        else:
+            summary = _replace(client, name, path, manifest, live, low_memory, report, username)
+    summary["seconds"] = round(time.time() - started)
+    return summary
 
-        removed_live = False
-        if low_memory and live:
-            report("Removing the current index to free memory…")
-            _remove_live_index(client, live)
-            removed_live, live = True, None
 
-        snapshot = f"file://{QDRANT_BUNDLES_DIR.rstrip('/')}/{name}/papers.snapshot"
-        size_gb = manifest["files"]["papers.snapshot"]["size"] / 2**30
-        try:
-            report(f"Qdrant is loading the snapshot ({size_gb:.1f} GB; about {max(1, round(size_gb * 1.5))} min "
-                   "on a hard disk)…")
-            try:
-                client.recover_snapshot(target, location=snapshot, priority=models.SnapshotPriority.SNAPSHOT,
-                                        wait=True)
-            except UnexpectedResponse as exc:
-                raise BundleError(f"Qdrant could not load the snapshot: {_qdrant_error(exc)}.") from exc
-            _wait_until_green(client, target, report)
-            report("Checking the loaded index…")
-            _check_collection(client, target, manifest)
+def _open_bundle(name, report):
+    """Bundle `name`, completely checked (manifest, files, SHA-256): (path, manifest, Qdrant client)."""
+    path = bundle_path(name)
+    manifest = read_manifest(path)
+    client = _qdrant()
+    try:
+        qdrant_version = client.info().version
+    except Exception as exc:
+        raise BundleError(f"Qdrant is not reachable at {QDRANT_URL}: {exc}")
+    problems = check_manifest(manifest, qdrant_version) + check_files(path, manifest)
+    if problems:
+        raise BundleError("The bundle cannot be imported: " + "; ".join(problems) + ".")
 
+    report("Checking the files (SHA-256)…", 0, 1)
+    verify_checksums(path, manifest, lambda done, total: report("Checking the files (SHA-256)…", done, total))
+    return path, manifest, client
+
+
+def _drop_unused_collections(client, live):
+    """Collections of earlier imports or ingests that are not in use."""
+    for c in client.get_collections().collections:
+        if c.name != live and re.match(rf"^{re.escape(QDRANT_COLLECTION)}_\d{{8}}_\d{{6}}$", c.name):
+            client.delete_collection(c.name)
+
+
+def _load_snapshot(client, name, manifest, target, report):
+    """Qdrant loads the bundle's snapshot into the new collection `target`, which is then checked."""
+    from qdrant_client.http import models
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    snapshot = f"file://{QDRANT_BUNDLES_DIR.rstrip('/')}/{name}/papers.snapshot"
+    size_gb = manifest["files"]["papers.snapshot"]["size"] / 2**30
+    report(f"Qdrant is loading the snapshot ({size_gb:.1f} GB; about {max(1, round(size_gb * 1.5))} min "
+           "on a hard disk)…")
+    try:
+        client.recover_snapshot(target, location=snapshot, priority=models.SnapshotPriority.SNAPSHOT, wait=True)
+    except UnexpectedResponse as exc:
+        raise BundleError(f"Qdrant could not load the snapshot: {_qdrant_error(exc)}.") from exc
+    _wait_until_green(client, target, report)
+    report("Checking the loaded index…")
+    _check_collection(client, target, manifest)
+
+
+def _bundle_meta(path, manifest):
+    """The bundle's index description (its index_meta.json, else the summary in manifest.json)."""
+    try:
+        with open(os.path.join(path, "index_meta.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        meta = {k: manifest.get(k) for k in ("papers", "chunks", "embed_model", "embed_dim", "format")}
+        meta["version"] = manifest["index_version"]
+        return meta
+
+
+def _replace(client, name, path, manifest, live, low_memory, report, username):
+    """The bundle becomes the index (steps 2 and 3 of the module description)."""
+    target = f"{QDRANT_COLLECTION}_{manifest['index_version']}"
+    if target == live and not low_memory:
+        raise BundleError("This index is already in use.")
+    _drop_unused_collections(client, live)
+
+    removed_live = False
+    if low_memory and live:
+        report("Removing the current index to free memory…")
+        _remove_live_index(client, live)
+        removed_live, live = True, None
+
+    try:
+        _load_snapshot(client, name, manifest, target, report)
+        report("Switching to the new index…")
+        _switch_alias(client, target)
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            if client.collection_exists(target):
+                client.delete_collection(target)
+        if removed_live and isinstance(exc, Exception):
+            raise BundleError(f"{exc} The previous index had been removed (low-memory import); "
+                              "import a bundle again.") from exc
+        raise
+
+    meta = _bundle_meta(path, manifest)
+    meta.update({"collection": target, "alias": QDRANT_COLLECTION, "bundle": name,
+                 "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"), "imported_by": username})
+    write_index_meta(meta)
+
+    if live and live != target:
+        report("Deleting the previous index…")
+        with contextlib.suppress(Exception):
+            client.delete_collection(live)
+
+    return {"mode": "replace", "bundle": name, "version": manifest["index_version"],
+            "papers": manifest.get("papers"), "chunks": manifest.get("chunks"), "collection": target,
+            "previous": live}
+
+
+def _add(client, name, path, manifest, live, report, username):
+    """The bundle's papers are added to the current index `live` (steps 2 and 3 of the module description)."""
+    meta = read_index_meta() or {}
+    version = manifest["index_version"]
+    staging = f"{QDRANT_COLLECTION}_{version}"
+    if version in index_versions(meta) or staging == live:
+        raise BundleError("This bundle is already in the index.")
+    if paper_index.is_legacy(client, live):
+        raise BundleError("The current index has the layout of an earlier version and cannot be extended; "
+                          "replace it with a bundle instead.")
+    if paper_index.dense_size(client, live) != manifest.get("embed_dim"):
+        raise BundleError("The current index has a different vector size than the bundle; "
+                          "replace it with a bundle instead.")
+    _drop_unused_collections(client, live)
+
+    # Only the smaller side is copied: a smaller bundle into the current index, or the current
+    # index into a larger bundle, which then becomes the index (like a replace).
+    into_bundle = (manifest.get("chunks") or 0) > client.count(live, exact=True).count
+    loaded = switched = False
+    try:
+        _load_snapshot(client, name, manifest, staging, report)
+        loaded = True
+        if into_bundle:
+            _, replaced = _copy_points(client, live, staging, report, "Copying the current index into the "
+                                       "loaded bundle…", source_wins=False)
+            new = max(0, (manifest.get("papers") or 0) - replaced)
             report("Switching to the new index…")
-            _switch_alias(client, target)
-        except BaseException as exc:
+            _switch_alias(client, staging)
+            switched = True
+        else:
+            new, replaced = _copy_points(client, staging, live, report, "Adding the bundle's papers to the "
+                                         "current index…")
+    except Exception as exc:
+        if loaded and into_bundle:
+            raise BundleError(f"Adding the papers failed: {_qdrant_error(exc)}. The current index is "
+                              "unchanged.") from exc
+        if loaded:
+            raise BundleError(f"Adding the papers failed: {_qdrant_error(exc)}. Papers of the bundle that were "
+                              "already in the index can be incomplete; add the bundle again.") from exc
+        raise
+    finally:
+        if not switched:
             with contextlib.suppress(Exception):
-                if client.collection_exists(target):
-                    client.delete_collection(target)
-            if removed_live and isinstance(exc, Exception):
-                raise BundleError(f"{exc} The previous index had been removed (low-memory import); "
-                                  "import a bundle again.") from exc
-            raise
+                if client.collection_exists(staging):
+                    report("Removing the loaded copy of the bundle…")
+                    client.delete_collection(staging)
 
-        try:
-            with open(os.path.join(path, "index_meta.json"), encoding="utf-8") as f:
-                meta = json.load(f)
-        except (OSError, ValueError):
-            meta = {k: manifest.get(k) for k in ("papers", "chunks", "embed_model", "embed_dim", "format")}
-            meta["version"] = manifest["index_version"]
-        meta.update({"collection": target, "alias": QDRANT_COLLECTION, "bundle": name,
-                     "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"), "imported_by": username})
-        write_index_meta(meta)
-
-        if live and live != target:
+    previous = None
+    if switched:
+        previous, live = live, staging
+        meta["collection"] = staging
+        if previous != QDRANT_COLLECTION:     # a collection named like the alias is gone already
             report("Deleting the previous index…")
             with contextlib.suppress(Exception):
-                client.delete_collection(live)
+                client.delete_collection(previous)
 
-        return {"bundle": name, "version": manifest["index_version"], "papers": manifest.get("papers"),
-                "chunks": manifest.get("chunks"), "collection": target, "previous": live,
-                "seconds": round(time.time() - started)}
+    chunks = client.count(live, exact=True).count
+    known = {(s.get("name"), s.get("added_at")) for s in meta.get("sources") or []}
+    sources = [s for s in _bundle_meta(path, manifest).get("sources") or []
+               if (s.get("name"), s.get("added_at")) not in known]
+    if meta.get("papers") is not None:
+        meta["papers"] += new
+    meta.setdefault("collection", live)
+    meta.setdefault("alias", QDRANT_COLLECTION)
+    meta.update({
+        "chunks": chunks,
+        "vectors": chunks,
+        "sources": (meta.get("sources") or []) + sources,
+        "added": (meta.get("added") or []) + [{
+            "bundle": name, "version": version, "papers": manifest.get("papers"), "papers_new": new,
+            "papers_replaced": replaced, "chunks": manifest.get("chunks"),
+            "added_at": time.strftime("%Y-%m-%d %H:%M:%S"), "added_by": username}],
+    })
+    write_index_meta(meta)
+
+    return {"mode": "add", "bundle": name, "version": version, "papers": manifest.get("papers"),
+            "papers_new": new, "papers_replaced": replaced, "chunks": manifest.get("chunks"),
+            "collection": live, "previous": previous, "index_papers": meta.get("papers"),
+            "index_chunks": chunks}
+
+
+def _copy_points(client, source, target, report, step, source_wins=True):
+    """
+    Copy the points of `source` into `target`, COPY_PAGE points at a time.  For a paper that is in
+    both, source_wins=True first deletes its points in `target` (the source may have fewer chunks
+    of it); source_wins=False keeps the points in `target` and skips the source's.
+    Returns (papers of `source` that were not in `target`, papers that were in both).
+    """
+    from qdrant_client.http import models
+
+    def papers(keys):
+        return models.FilterSelector(filter=models.Filter(must=[
+            models.FieldCondition(key="paper", match=models.MatchAny(any=list(keys)))]))
+
+    total = client.count(source, exact=True).count
+    # Paper key -> whether it was in `target` before the copy, decided at the first of its chunks
+    # (the chunks of one paper are spread over the pages).
+    in_target = {}
+    added = []                       # papers that were not in `target`
+    done = 0
+    offset = None
+    try:
+        while True:
+            points, offset = client.scroll(source, limit=COPY_PAGE, offset=offset, with_payload=True,
+                                           with_vectors=True, timeout=COPY_READ_TIMEOUT)
+            keys = {p.payload.get("paper") for p in points} - in_target.keys() - {None}
+            if keys:
+                # Every paper has a chunk 0; looking it up by id reads nothing from disk.
+                first = {paper_index.point_id(key, 0): key for key in keys}
+                present = {first[str(uuid.UUID(str(p.id)))] for p in client.retrieve(
+                    target, ids=list(first), with_payload=False, with_vectors=False)}
+                if present and source_wins:
+                    client.delete(target, wait=True, points_selector=papers(present))
+                in_target.update((key, key in present) for key in keys)
+                added.extend(keys - present)
+            copy = points if source_wins else [p for p in points if not in_target.get(p.payload.get("paper"))]
+            if copy:
+                client.upsert(target, wait=True, points=[
+                    models.PointStruct(id=p.id, vector=p.vector, payload=p.payload) for p in copy])
+            done += len(points)
+            report(step, done, total)
+            if offset is None:
+                return len(added), len(in_target) - len(added)
+    except BaseException:
+        if source_wins:
+            # Copied into the index in use: take the new papers out again, so that adding the
+            # bundle again counts them as new.
+            with contextlib.suppress(Exception):
+                for start in range(0, len(added), COPY_PAGE):
+                    client.delete(target, wait=True, points_selector=papers(added[start:start + COPY_PAGE]))
+        raise
 
 
 class ImportManager:
@@ -401,22 +599,23 @@ class ImportManager:
     def running(self):
         return self.snapshot().get("state") == "running"
 
-    def start(self, name, user, low_memory=False):
+    def start(self, name, user, low_memory=False, add=False):
         with self._lock:
             if self.state.get("state") == "running":
                 raise ImportBusyError("An index import is already running.")
-            self.state = {"state": "running", "bundle": name, "low_memory": low_memory, "step": "Starting…",
-                          "started_at": time.time(), "started_by": user["username"]}
-        threading.Thread(target=self._run, args=(name, user, low_memory), name="index-import", daemon=True).start()
+            self.state = {"state": "running", "bundle": name, "low_memory": low_memory, "add": add,
+                          "step": "Starting…", "started_at": time.time(), "started_by": user["username"]}
+        threading.Thread(target=self._run, args=(name, user, low_memory, add), name="index-import",
+                         daemon=True).start()
 
     def _report(self, step, done=None, total=None):
         with self._lock:
             self.state.update(step=step, done=done, total=total)
 
-    def _run(self, name, user, low_memory):
+    def _run(self, name, user, low_memory, add):
         from core import audit
         try:
-            result = import_bundle(name, low_memory, self._report, user["username"])
+            result = import_bundle(name, low_memory, self._report, user["username"], add=add)
         except Exception as exc:
             with self._lock:
                 self.state.update(state="failed", finished_at=time.time(), error=str(exc), step="Failed")

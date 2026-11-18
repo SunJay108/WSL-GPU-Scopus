@@ -162,18 +162,35 @@ For the fully offline PCs see `../Deploy-GPU-Project-Offline.md`.
    index (papers, version, when it was built and imported, sources, the quality check of the embedding
    app) and every bundle in `bundles/` with its status: *ready*, *in use*, or *cannot be imported* with
    the reason (wrong format or model, missing or incomplete files).
-3. Press **Import**. Progress is shown while it runs:
-   checking the files (SHA-256) → Qdrant loads the snapshot → checking the loaded index (number of
-   chunks, vector layout, a vector and a keyword search) → switching to the new index → deleting the
-   previous index.
+3. Press **Replace** (the bundle becomes the whole index) or **Add** (see below). Progress is shown
+   while it runs: checking the files (SHA-256) → Qdrant loads the snapshot → checking the loaded index
+   (number of chunks, vector layout, a vector and a keyword search) → switching to the new index →
+   deleting the previous index.
 4. Searches use the new index right away (no restart); it is warmed up in the background.
 5. **Delete** removes a bundle folder that is no longer needed (the index stays in use).
+
+**Add** puts the bundle's papers into the current index instead of replacing it. A paper that is
+already in the index (same DOI, or same title without DOI) is replaced by the bundle's copy, never
+duplicated. Copying takes about 20 s per 1,000 chunks on a hard disk, so only the smaller side is copied:
+
+- a bundle smaller than the current index is copied into it; searches keep working and find the added
+  papers while they are copied. If the add fails, its new papers are taken out again; add the bundle
+  again to complete papers it was replacing.
+- otherwise the current index is copied into the loaded bundle, which then becomes the index as with
+  **Replace**: searches use the current index until the switch, a failed add leaves it unchanged, and
+  Qdrant holds both indexes meanwhile.
+
+The index card then lists the added bundles and their sources. **Replace** stays the fastest way to load
+a bundle of a whole index.
+To make a bundle with only new papers, ingest them on the embedding PC with **Initialize index** and
+export – this replaces the embedding PC's own index with the new papers; keep the earlier bundles.
 
 Command line (same steps; the running search UI notices the new index within 15 seconds):
 
 ```bash
 docker exec -it scopus-ai-gpu python import_index.py               # list bundles and their status
-docker exec -it scopus-ai-gpu python import_index.py <bundle>      # import
+docker exec -it scopus-ai-gpu python import_index.py <bundle>      # import (replace)
+docker exec -it scopus-ai-gpu python import_index.py <bundle> --add      # add its papers to the index
 docker exec -it scopus-ai-gpu python import_index.py <bundle> --verify   # only check the files
 ```
 

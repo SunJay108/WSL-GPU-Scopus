@@ -19,9 +19,10 @@ Docker images, data and accounts, meant for two PCs:
    search app*. The bundle is one folder: a Qdrant snapshot, the index description, a manifest and
    SHA-256 checksums.
 2. Copy the bundle folder to the search PC into `search/bundles/`.
-3. In the search app: admin panel › **Index** › **Import**. The bundle is checked (format, embedding
+3. In the search app: admin panel › **Index** › **Replace**. The bundle is checked (format, embedding
    model, checksums), loaded and checked again before searches switch to it; until then the current
-   index stays in use.
+   index stays in use. **Add** instead adds the bundle's papers to the current index (for a bundle with
+   only new papers; a paper already in the index is replaced, not duplicated).
 
 The two apps share no database or network connection. They must agree on the index layout and the
 embedding model: `app/core/paper_index.py` and `app/core/embedding.py` are the same files in both apps,

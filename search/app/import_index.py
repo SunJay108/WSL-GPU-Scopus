@@ -2,8 +2,9 @@
 Command-line index import (the admin panel's Index tab does the same).
 
     docker exec -it scopus-ai-gpu python import_index.py                 # bundles in the bundles folder
-    docker exec -it scopus-ai-gpu python import_index.py NAME            # check and import bundle NAME
+    docker exec -it scopus-ai-gpu python import_index.py NAME            # check NAME; it replaces the index
     docker exec -it scopus-ai-gpu python import_index.py NAME --low-memory
+    docker exec -it scopus-ai-gpu python import_index.py NAME --add      # add its papers to the index
     docker exec -it scopus-ai-gpu python import_index.py NAME --verify   # only check the files
 
 The running search service notices the new index within seconds and warms it up.
@@ -35,8 +36,12 @@ def main():
     parser = argparse.ArgumentParser(description="Import an index bundle made by the embedding app.")
     parser.add_argument("bundle", nargs="?", help=f"bundle folder name in {BUNDLES_HOST_DIR}")
     parser.add_argument("--verify", action="store_true", help="only check the files (SHA-256), do not import")
-    parser.add_argument("--low-memory", action="store_true",
-                        help="delete the current index first: half the memory, no search during the import")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--low-memory", action="store_true",
+                      help="delete the current index first: half the memory, no search during the import")
+    mode.add_argument("--add", action="store_true",
+                      help="add the bundle's papers to the current index instead of replacing it "
+                           "(papers already in it are replaced by the bundle's copy)")
     args = parser.parse_args()
 
     if not args.bundle:
@@ -60,10 +65,10 @@ def main():
             print("✅ The bundle is complete and undamaged.")
             return 0
         db.init()
-        audit.log("index_import_start", detail={"bundle": args.bundle, "low_memory": args.low_memory},
-                  username="command line")
+        audit.log("index_import_start", detail={"bundle": args.bundle, "low_memory": args.low_memory,
+                                                "add": args.add}, username="command line")
         summary = index_import.import_bundle(args.bundle, low_memory=args.low_memory, report=_report,
-                                             username="command line")
+                                             username="command line", add=args.add)
     except (index_import.BundleError, index_import.ImportBusyError) as exc:
         print(f"❌ {exc}")
         if not args.verify:
@@ -71,8 +76,13 @@ def main():
                       username="command line")
         return 1
     audit.log("index_import_completed", detail=summary, username="command line")
-    print(f"✅ Imported {summary['papers'] or 0:,} papers ({summary['chunks'] or 0:,} chunks) in "
-          f"{summary['seconds']} s; the search uses the new index.")
+    if summary["mode"] == "add":
+        print(f"✅ Added {summary['papers_new']:,} new papers and replaced {summary['papers_replaced']:,} in "
+              f"{summary['seconds']} s; the index now has {summary['index_papers'] or 0:,} papers "
+              f"({summary['index_chunks']:,} chunks).")
+    else:
+        print(f"✅ Imported {summary['papers'] or 0:,} papers ({summary['chunks'] or 0:,} chunks) in "
+              f"{summary['seconds']} s; the search uses the new index.")
     return 0
 
 

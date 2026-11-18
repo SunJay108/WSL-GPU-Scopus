@@ -251,7 +251,8 @@ def index_details() -> dict:
     """The live index for the admin panel: its description and what Qdrant holds."""
     meta = read_index_meta() or {}
     details = {k: meta.get(k) for k in ("version", "built_at", "imported_at", "imported_by", "bundle", "papers",
-                                        "chunks", "embed_model", "format", "quality", "sources", "layout")}
+                                        "chunks", "embed_model", "format", "quality", "sources", "layout",
+                                        "added")}
     details.update(collection=None, points=None, status=None, error=None)
     try:
         client = get_qdrant()

@@ -114,11 +114,13 @@
       case "index_import_start":
         return [el("div", { class: "detail-main" }, d.bundle || ""),
           el("div", { class: "detail-sub" }, [d.papers ? `${Number(d.papers).toLocaleString()} papers` : "",
+            d.add ? "added to the current index" : "",
             d.low_memory ? "current index removed first" : ""].filter(Boolean).join(" · "))];
       case "index_import_completed":
         return [el("div", { class: "detail-main" }, d.bundle || ""),
-          el("div", { class: "detail-sub" },
-            `${Number(d.papers || 0).toLocaleString()} papers · ${Number(d.chunks || 0).toLocaleString()} chunks · ${Math.round(d.seconds || 0)} s`)];
+          el("div", { class: "detail-sub" }, d.mode === "add"
+            ? `added: ${Number(d.papers_new || 0).toLocaleString()} new papers · ${Number(d.papers_replaced || 0).toLocaleString()} replaced · ${Math.round(d.seconds || 0)} s`
+            : `${Number(d.papers || 0).toLocaleString()} papers · ${Number(d.chunks || 0).toLocaleString()} chunks · ${Math.round(d.seconds || 0)} s`)];
       case "index_import_failed":
         return [el("div", { class: "detail-main" }, d.bundle || ""), el("div", { class: "detail-sub" }, d.error || "")];
       case "bundle_deleted":
@@ -333,6 +335,8 @@
       if (idx.version) line.push(`version ${idx.version}`);
       if (idx.built_at) line.push(`built ${idx.built_at}`);
       if (idx.imported_at) line.push(`imported ${idx.imported_at}${idx.imported_by ? ` by ${idx.imported_by}` : ""}`);
+      const added = idx.added || [];
+      if (added.length) line.push(`${added.length} bundle${added.length > 1 ? "s" : ""} added, the last ${added[added.length - 1].added_at}`);
       line.push(`collection ${idx.collection} (${idx.status})`);
       if (idx.format && idx.format !== data.index_format) line.push(`⚠️ format ${idx.format}, this app: ${data.index_format}`);
     }
@@ -357,11 +361,13 @@
     banner.className = `banner ${ex.state}`;
     const elapsed = ex.started_at ? fmtDuration((ex.finished_at || Date.now() / 1000) - ex.started_at) : "";
     let text = "";
-    if (running) text = `Importing ${ex.bundle}: ${ex.step} (${elapsed})`;
+    if (running) text = `${ex.add ? "Adding" : "Importing"} ${ex.bundle}: ${ex.step} (${elapsed})`;
     else if (ex.state === "completed") {
       const r = ex.result || {};
-      text = `✅ ${r.bundle} imported in ${elapsed}: ${fmtNum(r.papers)} papers. The search uses the new index.`;
-    } else if (ex.state === "failed") text = `❌ Import of ${ex.bundle} failed: ${ex.error}`;
+      text = r.mode === "add"
+        ? `✅ ${r.bundle} added in ${elapsed}: ${fmtNum(r.papers_new)} new papers, ${fmtNum(r.papers_replaced)} replaced. The index now has ${fmtNum(r.index_papers)} papers.`
+        : `✅ ${r.bundle} imported in ${elapsed}: ${fmtNum(r.papers)} papers. The search uses the new index.`;
+    } else if (ex.state === "failed") text = `❌ ${ex.add ? "Adding" : "Import of"} ${ex.bundle} failed: ${ex.error}`;
     $("import-text").textContent = text;
     const withBar = running && ex.total > 1;
     $("import-bar-wrap").hidden = !withBar;
@@ -380,23 +386,40 @@
         el("td", { class: "nowrap" }, b.created_at || ""),
         el("td", {}, status),
         el("td", {}, el("div", { class: "row-actions" },
-          el("button", { class: "btn-primary", type: "button", disabled: running || !ok || b.in_use, onclick: () => startImport(b, idx) }, "Import"),
+          el("button", { class: "btn-primary", type: "button", title: "Make this bundle the whole index", disabled: running || !ok || b.in_use, onclick: () => startImport(b, idx, false) }, "Replace"),
+          el("button", { class: "btn", type: "button", title: "Add this bundle's papers to the current index", disabled: running || !ok || b.in_use, onclick: () => startImport(b, idx, true) }, "Add"),
           el("button", { class: "btn", type: "button", disabled: running && ex.bundle === b.name, onclick: () => deleteBundle(b) }, "Delete"))));
     });
     $("bundle-rows").replaceChildren(...(rows.length ? rows
       : [el("tr", {}, el("td", { colspan: "7", class: "muted" }, "No bundles found. Copy a bundle folder from the embedding PC into the folder above."))]));
   }
 
-  async function startImport(bundle, idx) {
-    const lowMemory = $("low-memory").checked;
-    const minutes = Math.max(1, Math.round((bundle.size / 2 ** 30) * 1.7));
-    const current = idx.collection ? `the current index (${fmtNum(idx.papers)} papers)` : "no current index";
-    const how = lowMemory
-      ? `The current index is deleted FIRST: search is unavailable during the import, and if the import fails there is no index until another import.`
-      : "Searches keep using the current index until the new one is loaded and checked; Qdrant needs memory for both meanwhile.";
-    if (!confirm(`Import ${bundle.name} (${fmtNum(bundle.papers)} papers) and replace ${current}?\n\n${how}\n\nThis takes about ${minutes} min on a hard disk.`)) return;
+  async function startImport(bundle, idx, add) {
+    const lowMemory = !add && $("low-memory").checked;
+    const sizeGb = bundle.size / 2 ** 30;
+    let question;
+    if (add && idx.collection) {
+      // Loading the snapshot, then copying the smaller side (about 20 s per 1,000 chunks on a hard disk).
+      const intoBundle = (bundle.chunks || 0) > (idx.points || 0);
+      const copied = Math.min(bundle.chunks || 0, idx.points || 0);
+      const minutes = Math.max(1, Math.round(sizeGb * 1.7 + copied / 3000));
+      const how = intoBundle
+        ? `The bundle is larger, so the current index (${fmtNum(idx.points)} chunks) is copied into it and it then becomes the index. Searches use the current index until then; if the add fails, the current index is unchanged.`
+        : `The bundle's ${fmtNum(bundle.chunks)} chunks are copied into the current index. Searches keep working and find the added papers while they are copied.`;
+      question = `Add ${bundle.name} (${fmtNum(bundle.papers)} papers) to the current index (${fmtNum(idx.papers)} papers)?\n\n`
+        + `Papers that are already in the index are replaced by the bundle's copy. ${how}\n\n`
+        + `This takes about ${minutes} min on a hard disk.`;
+    } else {
+      const minutes = Math.max(1, Math.round(sizeGb * 1.7));
+      const current = idx.collection ? `the current index (${fmtNum(idx.papers)} papers)` : "no current index";
+      const how = lowMemory
+        ? `The current index is deleted FIRST: search is unavailable during the import, and if the import fails there is no index until another import.`
+        : "Searches keep using the current index until the new one is loaded and checked; Qdrant needs memory for both meanwhile.";
+      question = `Import ${bundle.name} (${fmtNum(bundle.papers)} papers) and replace ${current}?\n\n${how}\n\nThis takes about ${minutes} min on a hard disk.`;
+    }
+    if (!confirm(question)) return;
     try {
-      await api("POST", "/api/admin/index/import", { bundle: bundle.name, low_memory: lowMemory });
+      await api("POST", "/api/admin/index/import", { bundle: bundle.name, low_memory: lowMemory, add });
     } catch (err) {
       alert(`The import could not start:\n\n${err.message}`);
     }
