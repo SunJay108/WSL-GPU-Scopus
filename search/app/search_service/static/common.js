@@ -127,7 +127,7 @@ window.UI = (() => {
     }
   }
 
-  const fmtDateTime = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "–");
+  const fmtDateTime = (ts) => (ts ? new Date(ts * 1000).toLocaleString(window.I18N ? I18N.locale() : undefined) : "–");
 
   async function logout() {
     try { await request("POST", "/api/auth/logout"); } catch (_) { /* already signed out */ }

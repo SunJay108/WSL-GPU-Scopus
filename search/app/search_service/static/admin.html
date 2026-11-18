@@ -3,75 +3,77 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Admin · Scopus AI</title>
+  <title data-i18n="admin.title">Admin · Scopus AI</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='10.5' cy='10.5' r='6.5' fill='none' stroke='%233b6fd8' stroke-width='2.5'/%3E%3Cpath d='m15.5 15.5 5 5' stroke='%233b6fd8' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/app.css">
-  <link rel="stylesheet" href="/static/admin.css">
+  <link rel="stylesheet" href="/static/app.css?v=20261118">
+  <link rel="stylesheet" href="/static/admin.css?v=20261118">
 </head>
 <body class="admin-body">
+  <!-- Page texts: static/i18n/en.js and zh.js (data-i18n keys); see static/i18n.js. -->
   <header class="admin-top">
     <div class="brand">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
       <span>Scopus AI</span>
-      <span class="role-badge">Admin</span>
+      <span class="role-badge" data-i18n="admin.badge">Admin</span>
     </div>
     <nav class="admin-tabs" role="tablist">
-      <button type="button" role="tab" data-tab="activity" aria-selected="true">Activity</button>
-      <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
-      <button type="button" role="tab" data-tab="users" aria-selected="false">Users</button>
-      <button type="button" role="tab" data-tab="index" aria-selected="false">Index</button>
+      <button type="button" role="tab" data-tab="activity" aria-selected="true" data-i18n="admin.tabActivity">Activity</button>
+      <button type="button" role="tab" data-tab="chats" aria-selected="false" data-i18n="admin.tabChats">Chats</button>
+      <button type="button" role="tab" data-tab="users" aria-selected="false" data-i18n="admin.tabUsers">Users</button>
+      <button type="button" role="tab" data-tab="index" aria-selected="false" data-i18n="admin.tabIndex">Index</button>
     </nav>
     <div class="admin-me">
       <span id="me"></span>
-      <a class="btn" href="/">Back to chat</a>
-      <button class="btn" id="logout" type="button">Log out</button>
+      <button class="btn" type="button" data-lang-switch></button>
+      <a class="btn" href="/" data-i18n="common.backToChat">Back to chat</a>
+      <button class="btn" id="logout" type="button" data-i18n="common.logout">Log out</button>
     </div>
   </header>
 
   <main class="admin-main" id="admin-main" hidden>
-    <section class="stats" id="stats" aria-label="Overview"></section>
+    <section class="stats" id="stats" aria-label="Overview" data-i18n-attr="aria-label: admin.overview"></section>
 
     <!-- Activity -->
     <section class="tab" id="tab-activity">
       <div class="filters">
-        <label class="field">User <select id="act-user"><option value="">All users</option></select></label>
-        <label class="field">Action <select id="act-action"><option value="">All actions</option></select></label>
-        <label class="field grow">Search <input id="act-q" type="search" placeholder="Question, chat title, user…"></label>
+        <label class="field"><span data-i18n="f.user">User</span> <select id="act-user"><option value="" data-i18n="f.allUsers">All users</option></select></label>
+        <label class="field"><span data-i18n="f.action">Action</span> <select id="act-action"><option value="" data-i18n="f.allActions">All actions</option></select></label>
+        <label class="field grow"><span data-i18n="f.search">Search</span> <input id="act-q" type="search" placeholder="Question, chat title, user…" data-i18n-attr="placeholder: f.actPlaceholder"></label>
       </div>
       <div class="table-wrap">
         <table class="table">
-          <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th><th>Chat</th></tr></thead>
+          <thead><tr><th data-i18n="col.time">Time</th><th data-i18n="col.user">User</th><th data-i18n="col.action">Action</th><th data-i18n="col.details">Details</th><th data-i18n="col.chat">Chat</th></tr></thead>
           <tbody id="act-rows"></tbody>
         </table>
       </div>
       <div class="table-foot">
         <span class="muted" id="act-count"></span>
-        <button class="btn" id="act-more" type="button" hidden>Load more</button>
+        <button class="btn" id="act-more" type="button" hidden data-i18n="act.loadMore">Load more</button>
       </div>
     </section>
 
     <!-- Chats -->
     <section class="tab" id="tab-chats" hidden>
       <div class="filters">
-        <label class="field">User <select id="chat-user"><option value="">All users</option></select></label>
-        <label class="field">Status
+        <label class="field"><span data-i18n="f.user">User</span> <select id="chat-user"><option value="" data-i18n="f.allUsers">All users</option></select></label>
+        <label class="field"><span data-i18n="f.status">Status</span>
           <select id="chat-status">
-            <option value="all">All chats</option>
-            <option value="active">Active</option>
-            <option value="deleted">Deleted by user</option>
+            <option value="all" data-i18n="f.allChats">All chats</option>
+            <option value="active" data-i18n="f.active">Active</option>
+            <option value="deleted" data-i18n="f.deletedByUser">Deleted by user</option>
           </select>
         </label>
-        <label class="field grow">Search <input id="chat-q" type="search" placeholder="Title or message text…"></label>
+        <label class="field grow"><span data-i18n="f.search">Search</span> <input id="chat-q" type="search" placeholder="Title or message text…" data-i18n-attr="placeholder: f.chatPlaceholder"></label>
       </div>
       <div class="split">
         <div class="table-wrap chat-list">
           <table class="table">
-            <thead><tr><th>Chat</th><th>User</th><th>Questions</th><th>Updated</th></tr></thead>
+            <thead><tr><th data-i18n="col.chat">Chat</th><th data-i18n="col.user">User</th><th data-i18n="col.questions">Questions</th><th data-i18n="col.updated">Updated</th></tr></thead>
             <tbody id="chat-rows"></tbody>
           </table>
         </div>
         <article class="viewer" id="viewer">
-          <p class="muted viewer-empty">Select a chat to read it.</p>
+          <p class="muted viewer-empty" data-i18n="chats.select">Select a chat to read it.</p>
         </article>
       </div>
     </section>
@@ -79,16 +81,16 @@
     <!-- Users -->
     <section class="tab" id="tab-users" hidden>
       <form class="filters add-user" id="add-user">
-        <label class="field">Username <input id="new-username" required minlength="3" maxlength="32" autocomplete="off"></label>
-        <label class="field">Password <input id="new-password" type="password" required minlength="8" autocomplete="new-password"></label>
-        <label class="field">Role
-          <select id="new-role"><option value="user">User</option><option value="admin">Admin</option></select>
+        <label class="field"><span data-i18n="common.username">Username</span> <input id="new-username" required minlength="3" maxlength="32" autocomplete="off"></label>
+        <label class="field"><span data-i18n="common.password">Password</span> <input id="new-password" type="password" required minlength="8" autocomplete="new-password"></label>
+        <label class="field"><span data-i18n="col.role">Role</span>
+          <select id="new-role"><option value="user" data-i18n="users.roleUser">User</option><option value="admin" data-i18n="users.roleAdmin">Admin</option></select>
         </label>
-        <button class="btn-primary" type="submit">Add user</button>
+        <button class="btn-primary" type="submit" data-i18n="users.add">Add user</button>
       </form>
       <div class="table-wrap">
         <table class="table">
-          <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>Last login</th><th>Last activity</th><th>Chats</th><th>Questions</th><th></th></tr></thead>
+          <thead><tr><th data-i18n="col.user">User</th><th data-i18n="col.role">Role</th><th data-i18n="col.status">Status</th><th data-i18n="col.created">Created</th><th data-i18n="col.lastLogin">Last login</th><th data-i18n="col.lastActivity">Last activity</th><th data-i18n="col.chats">Chats</th><th data-i18n="col.questions">Questions</th><th></th></tr></thead>
           <tbody id="user-rows"></tbody>
         </table>
       </div>
@@ -97,12 +99,12 @@
     <!-- Index -->
     <section class="tab" id="tab-index" hidden>
       <div>
-        <h3 class="tab-title">Current index</h3>
+        <h3 class="tab-title" data-i18n="index.current">Current index</h3>
         <div class="stats" id="index-stats"></div>
         <p class="muted index-line" id="index-line"></p>
         <p class="index-quality" id="index-quality" hidden></p>
         <details class="index-sources" id="index-sources" hidden>
-          <summary>Sources</summary>
+          <summary data-i18n="index.sources">Sources</summary>
           <div class="table-wrap">
             <table class="table"><tbody id="index-source-rows"></tbody></table>
           </div>
@@ -110,8 +112,9 @@
       </div>
 
       <div>
-        <h3 class="tab-title">Import a bundle</h3>
-        <p class="muted">Bundles are made by the embedding app (<em>Export for the search app</em>). Copy the whole
+        <h3 class="tab-title" data-i18n="index.import">Import a bundle</h3>
+        <!-- #bundles-dir is part of the translated text; admin.js fills it in. -->
+        <p class="muted" data-i18n-html="index.importHint">Bundles are made by the embedding app (<em>Export for the search app</em>). Copy the whole
           bundle folder into <code id="bundles-dir"></code> on this PC; it then appears below.
           <strong>Replace</strong> makes the bundle the whole index; searches keep using the current index until
           the new one is loaded and checked. <strong>Add</strong> adds the bundle's papers to the current index
@@ -121,10 +124,10 @@
           <div class="bar" id="import-bar-wrap" hidden><div class="bar-fill" id="import-bar"></div></div>
         </div>
         <label class="check"><input type="checkbox" id="low-memory">
-          Replace: remove the current index first (needs half the memory; no search during the import)</label>
+          <span data-i18n="index.lowMemory">Replace: remove the current index first (needs half the memory; no search during the import)</span></label>
         <div class="table-wrap">
           <table class="table">
-            <thead><tr><th>Bundle</th><th class="num">Papers</th><th class="num">Chunks</th><th class="num">Size</th><th>Created</th><th>Status</th><th></th></tr></thead>
+            <thead><tr><th data-i18n="col.bundle">Bundle</th><th class="num" data-i18n="col.papers">Papers</th><th class="num" data-i18n="col.chunks">Chunks</th><th class="num" data-i18n="col.size">Size</th><th data-i18n="col.created">Created</th><th data-i18n="col.status">Status</th><th></th></tr></thead>
             <tbody id="bundle-rows"></tbody>
           </table>
         </div>
@@ -133,12 +136,15 @@
   </main>
 
   <div class="denied" id="denied" hidden>
-    <h2>Administrators only</h2>
-    <p class="muted">Your account cannot open the admin panel.</p>
-    <a class="btn" href="/">Back to chat</a>
+    <h2 data-i18n="admin.deniedTitle">Administrators only</h2>
+    <p class="muted" data-i18n="admin.deniedText">Your account cannot open the admin panel.</p>
+    <a class="btn" href="/" data-i18n="common.backToChat">Back to chat</a>
   </div>
 
-  <script src="/static/common.js"></script>
-  <script src="/static/admin.js"></script>
+  <script src="/static/i18n/en.js?v=20261118"></script>
+  <script src="/static/i18n/zh.js?v=20261118"></script>
+  <script src="/static/i18n.js?v=20261118"></script>
+  <script src="/static/common.js?v=20261118"></script>
+  <script src="/static/admin.js?v=20261118"></script>
 </body>
 </html>

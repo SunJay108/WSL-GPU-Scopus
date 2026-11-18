@@ -5,83 +5,88 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Scopus AI</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='10.5' cy='10.5' r='6.5' fill='none' stroke='%233b6fd8' stroke-width='2.5'/%3E%3Cpath d='m15.5 15.5 5 5' stroke='%233b6fd8' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=20261118">
 </head>
 <body>
+  <!-- Page texts: static/i18n/en.js and zh.js (data-i18n keys); see static/i18n.js. -->
+
   <!-- Sign in / create account -->
   <div class="auth" id="auth" hidden>
     <form class="auth-card" id="auth-form" autocomplete="on">
+      <button type="button" class="auth-lang" data-lang-switch></button>
       <div class="brand auth-brand">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
         <span>Scopus AI</span>
       </div>
       <div class="auth-tabs" role="tablist">
-        <button type="button" role="tab" class="auth-tab" id="tab-login" aria-selected="true">Sign in</button>
-        <button type="button" role="tab" class="auth-tab" id="tab-signup" aria-selected="false">Create account</button>
+        <button type="button" role="tab" class="auth-tab" id="tab-login" aria-selected="true" data-i18n="auth.signIn">Sign in</button>
+        <button type="button" role="tab" class="auth-tab" id="tab-signup" aria-selected="false" data-i18n="auth.createAccount">Create account</button>
       </div>
-      <p class="auth-note" id="auth-first" hidden>No accounts exist yet. The first account becomes the <strong>administrator</strong>.</p>
-      <label class="field">Username
+      <p class="auth-note" id="auth-first" hidden data-i18n-html="auth.firstUser">No accounts exist yet. The first account becomes the <strong>administrator</strong>.</p>
+      <label class="field"><span data-i18n="common.username">Username</span>
         <input id="auth-username" name="username" autocomplete="username" required minlength="3" maxlength="32">
       </label>
-      <label class="field">Password
+      <label class="field"><span data-i18n="common.password">Password</span>
         <input id="auth-password" name="password" type="password" autocomplete="current-password" required>
       </label>
-      <label class="field" id="auth-confirm-wrap" hidden>Repeat password
+      <label class="field" id="auth-confirm-wrap" hidden><span data-i18n="auth.repeatPassword">Repeat password</span>
         <input id="auth-confirm" type="password" autocomplete="new-password">
       </label>
       <p class="auth-error" id="auth-error" role="alert" hidden></p>
       <button class="btn-primary" id="auth-submit" type="submit">Sign in</button>
       <p class="auth-hint" id="auth-hint"></p>
-      <p class="auth-privacy">Administrators can review chats, including deleted ones, and account activity.</p>
+      <p class="auth-privacy" data-i18n="auth.privacy">Administrators can review chats, including deleted ones, and account activity.</p>
     </form>
   </div>
 
   <div class="app" id="app" hidden>
-    <aside class="sidebar" id="sidebar" aria-label="Chat history">
+    <aside class="sidebar" id="sidebar" aria-label="Chat history" data-i18n-attr="aria-label: side.label">
       <div class="side-top">
         <div class="brand">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
           <span>Scopus AI</span>
         </div>
-        <button class="icon-btn mobile-only" id="close-sidebar" type="button" aria-label="Close sidebar">
+        <button class="icon-btn mobile-only" id="close-sidebar" type="button" aria-label="Close sidebar" data-i18n-attr="aria-label: side.close">
           <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
         </button>
       </div>
 
       <button class="new-chat" id="new-chat" type="button">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        New chat
+        <span data-i18n="chat.new">New chat</span>
       </button>
 
       <label class="search">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
-        <input id="search" type="search" placeholder="Search chats" autocomplete="off">
+        <input id="search" type="search" placeholder="Search chats" autocomplete="off" data-i18n-attr="placeholder: side.search">
       </label>
 
       <nav class="conv-list" id="conv-list"></nav>
 
       <div class="side-bottom">
-        <div class="index-info" id="index-info">Loading index…</div>
+        <div class="index-info" id="index-info"></div>
         <div class="user-row">
           <span class="user-avatar" id="user-avatar"></span>
           <span class="user-name" id="user-name"></span>
-          <span class="role-badge" id="user-role" hidden>admin</span>
+          <span class="role-badge" id="user-role" hidden data-i18n="side.adminBadge">admin</span>
         </div>
-        <a class="side-link" id="admin-link" href="/admin" hidden>Admin panel</a>
-        <button class="side-link" id="password-btn" type="button">Change password</button>
-        <button class="side-link" id="logout-btn" type="button">Log out</button>
-        <button class="side-link danger" id="clear-all" type="button">Delete all my chats</button>
+        <a class="side-link" id="admin-link" href="/admin" hidden data-i18n="side.adminPanel">Admin panel</a>
+        <button class="side-link" type="button" data-lang-switch></button>
+        <button class="side-link" id="password-btn" type="button" data-i18n="side.changePassword">Change password</button>
+        <button class="side-link" id="logout-btn" type="button" data-i18n="common.logout">Log out</button>
+        <button class="side-link danger" id="clear-all" type="button" data-i18n="side.deleteAll">Delete all my chats</button>
       </div>
     </aside>
     <div class="scrim" id="scrim" hidden></div>
 
     <main class="main">
       <header class="topbar">
-        <button class="icon-btn mobile-only" id="open-sidebar" type="button" aria-label="Open chat history">
+        <button class="icon-btn mobile-only" id="open-sidebar" type="button" aria-label="Open chat history" data-i18n-attr="aria-label: side.open">
           <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
         </button>
         <h1 id="chat-title">New chat</h1>
-        <button class="icon-btn" id="export-btn" type="button" title="Export chat as Markdown" aria-label="Export chat as Markdown" hidden>
+        <button class="icon-btn" id="export-btn" type="button" title="Export chat as Markdown" aria-label="Export chat as Markdown"
+          data-i18n-attr="title: chat.export; aria-label: chat.export" hidden>
           <svg viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 19h14"/></svg>
         </button>
       </header>
@@ -90,37 +95,41 @@
 
       <footer class="composer-wrap">
         <form class="composer" id="composer">
-          <textarea id="input" rows="1" maxlength="2000" placeholder="Ask a research question…" aria-label="Question"></textarea>
-          <button class="send" id="send" type="submit" aria-label="Send" disabled>
+          <textarea id="input" rows="1" maxlength="2000" placeholder="Ask a research question…" aria-label="Question"
+            data-i18n-attr="aria-label: chat.question"></textarea>
+          <button class="send" id="send" type="submit" aria-label="Send" data-i18n-attr="aria-label: chat.send" disabled>
             <svg viewBox="0 0 24 24"><path d="M12 19V5m0 0-6 6m6-6 6 6"/></svg>
           </button>
         </form>
-        <p class="disclaimer">Answers are generated from the local paper database and can contain mistakes. Check the cited papers.</p>
+        <p class="disclaimer" data-i18n="chat.disclaimer">Answers are generated from the local paper database and can contain mistakes. Check the cited papers.</p>
       </footer>
     </main>
   </div>
 
   <dialog class="dialog" id="password-dialog">
     <form method="dialog" id="password-form">
-      <h2>Change password</h2>
-      <label class="field">Current password
+      <h2 data-i18n="pw.title">Change password</h2>
+      <label class="field"><span data-i18n="pw.current">Current password</span>
         <input id="pw-current" type="password" autocomplete="current-password" required>
       </label>
-      <label class="field">New password
+      <label class="field"><span data-i18n="pw.new">New password</span>
         <input id="pw-new" type="password" autocomplete="new-password" required minlength="8">
       </label>
-      <label class="field">Repeat new password
+      <label class="field"><span data-i18n="pw.repeat">Repeat new password</span>
         <input id="pw-repeat" type="password" autocomplete="new-password" required minlength="8">
       </label>
       <p class="auth-error" id="pw-error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <button type="button" class="btn" id="pw-cancel">Cancel</button>
-        <button type="submit" class="btn-primary" id="pw-save">Save</button>
+        <button type="button" class="btn" id="pw-cancel" data-i18n="common.cancel">Cancel</button>
+        <button type="submit" class="btn-primary" id="pw-save" data-i18n="common.save">Save</button>
       </div>
     </form>
   </dialog>
 
-  <script src="/static/common.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/i18n/en.js?v=20261118"></script>
+  <script src="/static/i18n/zh.js?v=20261118"></script>
+  <script src="/static/i18n.js?v=20261118"></script>
+  <script src="/static/common.js?v=20261118"></script>
+  <script src="/static/app.js?v=20261118"></script>
 </body>
 </html>
