@@ -225,6 +225,24 @@ Open **http://localhost:7860** – a chat interface similar to ChatGPT:
   `[n]`, reference cards (journal, year, DOI link, relevance) and three suggested follow-up questions.
   The same question gives the same papers: candidates with tied search scores are ordered by id.
 - **Export** a chat as Markdown (⤓ in the top bar); **copy** a single answer.
+- **Language**: *中文* / *English* in the sidebar, on the sign-in card and in the admin panel's top
+  bar switches the page texts between English and Simplified Chinese; each browser remembers its
+  choice. See [Page language](#page-language-english--中文).
+
+### Page language (English / 中文)
+
+The page texts are in `app/search_service/static/i18n/en.js` and `zh.js` (same keys in both;
+a key missing from `zh.js` shows in English); `static/i18n.js` switches between them. Questions,
+answers (with their sections and references), the example questions and messages from the server
+(errors, import steps, bundle problems) are not translated. The model already answers in the
+language of the question.
+
+Chinese is drawn with the bundled **Noto Sans SC** (`static/fonts/`, SIL Open Font License,
+about 1.1 MB per weight, 7,900 characters). The browser downloads it only when a page shows Chinese;
+Latin text keeps the system font.
+
+The files under `static/` are read on every request, so changes to texts, pages or fonts need
+neither a rebuild nor a restart: copy them into `app/` and reload the page (Ctrl+F5).
 
 ### Accounts and admin panel
 
@@ -502,5 +520,6 @@ docker compose build --no-cache scopus-ai  # rebuild the image after dependency 
 docker exec -it scopus-ai-gpu python import_index.py   # list index bundles
 ```
 
-Python and UI changes under `app/` take effect after restarting the container (the folder is
-bind-mounted); no image rebuild is needed.
+Python changes under `app/` take effect after restarting the container (the folder is
+bind-mounted); no image rebuild is needed. Files under `app/search_service/static/` (pages,
+scripts, texts, fonts) need no restart: reload the page.

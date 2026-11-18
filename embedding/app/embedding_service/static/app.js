@@ -2,6 +2,7 @@
 
 (() => {
   const $ = (id) => document.getElementById(id);
+  const { t } = window.I18N;
   const UPLOAD_EXT = [".frm", ".myd", ".myi", ".ris"];
 
   const state = {
@@ -14,6 +15,7 @@
     alerted: new Set(),
     logSeq: 0,
     uploading: false,
+    deniedUser: "",
   };
 
   // ---------------------------------------------------------------- helpers
@@ -31,12 +33,15 @@
     if (sec == null) return "";
     sec = Math.max(0, Math.round(sec));
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    if (h) return `${h}h ${m}m`;
-    if (m) return `${m}m ${s}s`;
-    return `${s}s`;
+    if (h) return t("dur.hm", { h, m });
+    if (m) return t("dur.ms", { m, s });
+    return t("dur.s", { s });
   }
 
-  const fmtClock = (t) => new Date(t * 1000).toLocaleString();
+  const fmtClock = (ts) => new Date(ts * 1000).toLocaleString(I18N.locale());
+
+  // Stage labels come from the server in English; zh.js translates them by stage key.
+  const stageLabel = (s) => (I18N.has(`stage.${s.key}`) ? t(`stage.${s.key}`) : s.label);
 
   function el(tag, attrs = {}, ...children) {
     const node = document.createElement(tag);
@@ -97,7 +102,7 @@
       storageSet("embedding.path", state.path);
     } catch (err) {
       if (path) return openFolder("");  // remembered folder disappeared
-      $("folders").replaceChildren(el("li", { class: "empty" }, `Cannot open folder: ${err.message}`));
+      $("folders").replaceChildren(el("li", { class: "empty" }, t("folder.cannotOpen", { error: err.message })));
       return;
     }
     renderFolder();
@@ -119,14 +124,12 @@
 
     $("up-btn").disabled = f.parent == null;
     $("upload-btn").disabled = !f.writable || state.uploading;
-    $("upload-btn").title = f.writable
-      ? "Copy a folder from this computer into the import folder"
-      : "The import folder is mounted read-only";
+    $("upload-btn").title = t(f.writable ? "folder.uploadTitle" : "folder.readOnly");
 
     const items = f.folders.map((d) => {
       const parts = [];
-      if (d.tables) parts.push(`${d.tables} table${d.tables > 1 ? "s" : ""}`);
-      if (d.ris_files) parts.push(`${d.ris_files} RIS`);
+      if (d.tables) parts.push(t("folder.tables", { n: d.tables }));
+      if (d.ris_files) parts.push(t("folder.ris", { n: d.ris_files }));
       return el("li", {},
         el("button", { type: "button", class: parts.length ? "has-data" : null, onclick: () => openFolder(d.path) },
           FOLDER_ICON(),
@@ -134,7 +137,7 @@
           parts.length ? el("span", { class: "badge" }, parts.join(" · ")) : null));
     });
     $("folders").replaceChildren(...(items.length ? items
-      : [el("li", { class: "empty" }, "No sub-folders.")]));
+      : [el("li", { class: "empty" }, t("folder.none"))]));
 
     $("selected-folder").textContent = f.display;
     renderImportables();
@@ -147,37 +150,38 @@
 
     if (!scan.importable) {
       children.push(el("div", { class: "empty-box" },
-        "No importable files in this folder.", el("br"),
-        "Open a folder that contains .frm / .MYD / .MYI or .ris files."));
+        t("ingest.noFiles"), el("br"),
+        t("ingest.noFilesHint")));
     } else {
       const rows = [];
-      for (const t of scan.tables) {
-        const disabled = !t.complete;
+      for (const tbl of scan.tables) {
+        const disabled = !tbl.complete;
         rows.push(el("label", { class: disabled ? "disabled" : null },
-          el("input", { type: "checkbox", class: "table-check", value: t.name, checked: !disabled, disabled, onchange: updateIngestButton }),
-          el("span", { class: "tname", title: t.name }, t.name),
-          t.needs_index_rebuild ? el("span", { class: "note" }, "no .MYI – index rebuilt") : null,
-          disabled ? el("span", { class: "note" }, `missing ${t.missing.join(", ")}`) : null,
-          el("span", { class: "size" }, fmtBytes(t.size))));
+          el("input", { type: "checkbox", class: "table-check", value: tbl.name, checked: !disabled, disabled, onchange: updateIngestButton }),
+          el("span", { class: "tname", title: tbl.name }, tbl.name),
+          tbl.needs_index_rebuild ? el("span", { class: "note" }, t("ingest.noMyi")) : null,
+          disabled ? el("span", { class: "note" }, t("ingest.missing", { files: tbl.missing.join(", ") })) : null,
+          el("span", { class: "size" }, fmtBytes(tbl.size))));
       }
       if (scan.ris_files.length) {
         const size = scan.ris_files.reduce((a, r) => a + r.size, 0);
         rows.push(el("label", {},
           el("input", { type: "checkbox", id: "ris-check", checked: true, onchange: updateIngestButton }),
-          el("span", { class: "tname" }, `RIS files (${scan.ris_files.length})`),
+          el("span", { class: "tname" }, t("ingest.risFiles", { n: scan.ris_files.length })),
           el("span", { class: "size" }, fmtBytes(size))));
       }
-      const complete = scan.tables.filter((t) => t.complete).length;
+      const complete = scan.tables.filter((tbl) => tbl.complete).length;
       children.push(el("div", { class: "importables" },
         el("div", { class: "head" },
           el("span", {}, [
-            complete ? `${complete} MySQL table${complete > 1 ? "s" : ""}` : null,
-            scan.ris_files.length ? `${scan.ris_files.length} RIS file${scan.ris_files.length > 1 ? "s" : ""}` : null,
+            complete ? t("ingest.tables", { n: complete }) : null,
+            scan.ris_files.length ? t("ingest.risCount", { n: scan.ris_files.length }) : null,
           ].filter(Boolean).join(" · ")),
           el("span", { class: "muted" }, fmtBytes(scan.total_size))),
         rows));
     }
 
+    // The scan warnings are server messages and stay in English.
     if (scan.warnings.length) {
       children.push(el("ul", { class: "warnings" }, scan.warnings.map((w) => el("li", {}, w))));
     }
@@ -200,15 +204,15 @@
     const nothing = !sel.tables.length && !sel.includeRis;
 
     let reason = "";
-    if (running) reason = "An ingest job is running.";
-    else if (exportRunning()) reason = "An export is running; start the ingest when it has finished.";
-    else if (!state.folder || !state.folder.scan.importable) reason = "Select a folder with data first.";
-    else if (nothing) reason = "Select at least one table or the RIS files.";
-    else if (services.qdrant && !services.qdrant.ok) reason = "Qdrant is not reachable.";
-    else if (sel.tables.length && services.mariadb && !services.mariadb.ok) reason = "MariaDB is not reachable (needed for MySQL tables).";
+    if (running) reason = t("ingest.whyRunning");
+    else if (exportRunning()) reason = t("ingest.whyExport");
+    else if (!state.folder || !state.folder.scan.importable) reason = t("ingest.whyNoFolder");
+    else if (nothing) reason = t("ingest.whyNothing");
+    else if (services.qdrant && !services.qdrant.ok) reason = t("ingest.whyQdrant");
+    else if (sel.tables.length && services.mariadb && !services.mariadb.ok) reason = t("ingest.whyMariadb");
 
     btn.disabled = !!reason;
-    btn.textContent = running ? "Ingest running…" : "Start ingest";
+    btn.textContent = t(running ? "ingest.running" : "ingest.start");
     hint.textContent = reason;
   }
 
@@ -219,13 +223,10 @@
     const hasIndex = idx && idx.collection;
 
     if (mode === "replace" && hasIndex) {
-      const papers = idx.meta && idx.meta.papers ? `${fmtNum(idx.meta.papers)} papers` : `${fmtNum(idx.points)} vectors`;
-      const ok = confirm(
-        `Initialize the index?\n\nThe current index (${papers}) will be deleted and a new index is built ` +
-        `from this folder only:\n${state.folder.display}\n\n` +
-        "The current index is kept until the new one is complete. To keep the indexed papers, " +
-        "cancel and use \"Add to index\".");
-      if (!ok) return;
+      const what = idx.meta && idx.meta.papers
+        ? t("ingest.papers", { n: fmtNum(idx.meta.papers) })
+        : t("ingest.vectors", { n: fmtNum(idx.points) });
+      if (!confirm(t("ingest.confirmReplace", { what, folder: state.folder.display }))) return;
     }
 
     $("ingest-btn").disabled = true;
@@ -241,7 +242,7 @@
       $("status-title").scrollIntoView({ behavior: "smooth", block: "start" });
       poll(true);
     } catch (err) {
-      alert(`Could not start ingest:\n\n${err.message}`);
+      alert(t("ingest.cannotStart", { error: err.message }));
       updateIngestButton();
     }
   }
@@ -251,7 +252,7 @@
   async function uploadFolder(fileList) {
     const files = [...fileList].filter((f) => UPLOAD_EXT.some((e) => f.name.toLowerCase().endsWith(e)));
     if (!files.length) {
-      alert("The selected folder contains no .frm, .MYD, .MYI or .ris files.");
+      alert(t("upload.noFiles"));
       return;
     }
     const rootName = (files[0].webkitRelativePath || "folder").split("/")[0];
@@ -268,7 +269,7 @@
     try {
       const upload = await api("POST", "/api/uploads", { name: rootName });
       for (const [i, file] of unique.entries()) {
-        $("upload-label").textContent = `Uploading ${file.name} (${i + 1}/${unique.length})`;
+        $("upload-label").textContent = t("upload.file", { name: file.name, i: i + 1, total: unique.length });
         await putFile(`/api/uploads/${encodeURIComponent(upload.id)}/${encodeURIComponent(file.name)}`, file, (loaded) => {
           const pct = total ? ((sent + loaded) / total) * 100 : 100;
           $("upload-bar").style.width = `${pct}%`;
@@ -276,10 +277,10 @@
         });
         sent += file.size;
       }
-      $("upload-label").textContent = `Uploaded ${unique.length} file(s)`;
+      $("upload-label").textContent = t("upload.done", { n: unique.length });
       await openFolder(upload.path);
     } catch (err) {
-      alert(`Upload failed:\n\n${err.message}`);
+      alert(t("upload.failed", { error: err.message }));
     } finally {
       state.uploading = false;
       setTimeout(() => { $("upload-progress").hidden = true; $("upload-bar").style.width = "0"; }, 1500);
@@ -299,7 +300,7 @@
         try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) { /* not JSON */ }
         reject(new Error(`${file.name}: ${detail}`));
       };
-      xhr.onerror = () => reject(new Error(`${file.name}: network error`));
+      xhr.onerror = () => reject(new Error(`${file.name}: ${t("upload.network")}`));
       xhr.send(file);
     });
   }
@@ -346,39 +347,39 @@
   function renderServices(services) {
     const list = $("services");
     if (!services) {
-      list.replaceChildren(el("li", {}, el("span", { class: "dot bad" }), "Embedding service unreachable"));
+      list.replaceChildren(el("li", {}, el("span", { class: "dot bad" }), t("svc.unreachable")));
       return;
     }
-    const entries = [["qdrant", "Qdrant"], ["mariadb", "MariaDB"], ["device", "Device"]];
+    const entries = [["qdrant", "Qdrant"], ["mariadb", "MariaDB"], ["device", t("svc.device")]];
     list.replaceChildren(...entries.map(([key, name]) => {
       const s = services[key] || {};
       const cls = s.ok == null ? "" : s.ok ? "ok" : key === "device" ? "warn" : "bad";
-      return el("li", { title: `${name}: ${s.detail || "unknown"}` },
+      return el("li", { title: `${name}: ${s.detail || t("svc.unknown")}` },
         el("span", { class: `dot ${cls}` }),
-        key === "device" ? s.detail || "Device" : name);
+        key === "device" ? s.detail || name : name);
     }));
   }
 
   function renderIndex(idx) {
     const stats = $("index-stats");
     const meta = idx.meta;
-    $("index-version").textContent = meta ? `version ${meta.version} · built ${meta.built_at}` : "";
+    $("index-version").textContent = meta ? t("index.version", { v: String(meta.version), at: meta.built_at }) : "";
 
     if (idx.error) {
       stats.replaceChildren(el("span", { class: "muted" }, idx.error));
     } else if (!idx.collection) {
-      stats.replaceChildren(el("span", { class: "muted" }, "No index yet. Select a data folder below and start an ingest."));
+      stats.replaceChildren(el("span", { class: "muted" }, t("index.none")));
     } else if (!meta) {
       stats.replaceChildren(
-        stat(fmtNum(idx.points), "vectors"),
-        el("span", { class: "muted" }, "Built by the previous ingest script (no details recorded)."));
+        stat(fmtNum(idx.points), t("index.vectors")),
+        el("span", { class: "muted" }, t("index.legacy")));
     } else {
       stats.replaceChildren(
-        stat(fmtNum(meta.papers), "papers"),
-        stat(fmtNum(meta.chunks), "chunks"),
-        stat(fmtNum(idx.points), "vectors in Qdrant"),
-        stat(String((meta.sources || []).length), "sources"),
-        stat(meta.embed_model || "–", "embedding model"));
+        stat(fmtNum(meta.papers), t("index.papers")),
+        stat(fmtNum(meta.chunks), t("index.chunks")),
+        stat(fmtNum(idx.points), t("index.points")),
+        stat(String((meta.sources || []).length), t("index.sourcesCount")),
+        stat(meta.embed_model || "–", t("index.model")));
     }
 
     const q = meta && meta.quality;
@@ -387,8 +388,9 @@
     if (q) {
       const low = Math.min(q.keyword_found, q.vector_found) < 0.8 * q.sample;
       quality.className = `quality ${low ? "low" : "ok"}`;
-      quality.textContent = `${low ? "⚠️" : "✓"} Quality check of the last ingest: of ${q.sample} new papers looked up by title, ` +
-        `${q.keyword_found} were found by keyword search and ${q.vector_found} by vector search (top ${q.top}).`;
+      quality.textContent = t("index.quality", {
+        mark: low ? "⚠️" : "✓", sample: q.sample, kw: q.keyword_found, vec: q.vector_found, top: q.top,
+      });
     }
 
     const sources = (meta && meta.sources) || [];
@@ -396,7 +398,7 @@
     $("index-sources-body").replaceChildren(...sources.map((s) =>
       el("tr", {},
         el("td", {}, s.name),
-        el("td", { class: "num" }, `${fmtNum(s.papers)} papers`),
+        el("td", { class: "num" }, t("index.sourcePapers", { n: fmtNum(s.papers) })),
         el("td", { class: "num muted" }, s.added_at || ""))));
   }
 
@@ -404,16 +406,8 @@
     return el("div", { class: "stat" }, el("strong", {}, value), el("span", {}, label));
   }
 
-  const COUNTERS = [
-    ["tables", "MySQL tables"],
-    ["ris_files", "RIS files"],
-    ["rows", "Rows read"],
-    ["papers", "Papers kept"],
-    ["skipped_no_abstract", "No abstract"],
-    ["skipped_duplicate", "Duplicates"],
-    ["chunks", "Chunks"],
-    ["embedded", "Vectors embedded"],
-  ];
+  // Job counters, in this order; the labels are count.<key>.
+  const COUNTERS = ["tables", "ris_files", "rows", "papers", "skipped_no_abstract", "skipped_duplicate", "chunks", "embedded"];
 
   function renderJob(job) {
     $("job-empty").hidden = !!job;
@@ -426,28 +420,23 @@
 
     const pill = $("job-pill");
     pill.className = `pill ${job.state}`;
-    pill.textContent = job.state[0].toUpperCase() + job.state.slice(1);
+    pill.textContent = I18N.has(`state.${job.state}`) ? t(`state.${job.state}`) : job.state[0].toUpperCase() + job.state.slice(1);
     $("cancel-btn").hidden = job.state !== "running";
     $("cancel-btn").disabled = job.cancel_requested;
 
     const current = job.stages.find((s) => s.key === job.stage);
     let stageText;
     if (job.state === "running") {
-      stageText = current ? current.label : "Starting…";
+      stageText = current ? stageLabel(current) : t("job.starting");
       if (current && current.total) stageText += ` — ${fmtNum(current.done)} / ${fmtNum(current.total)}`;
     } else {
-      stageText = {
-        completed: "Finished",
-        failed: "Failed",
-        cancelled: "Cancelled",
-        interrupted: "Interrupted",
-      }[job.state] || job.state;
+      stageText = I18N.has(`end.${job.state}`) ? t(`end.${job.state}`) : job.state;
     }
     $("job-stage").textContent = stageText;
 
-    const times = [`elapsed ${fmtDuration(job.elapsed)}`];
-    if (job.eta != null) times.push(`about ${fmtDuration(job.eta)} left`);
-    if (job.state !== "running" && job.finished_at) times.push(`ended ${fmtClock(job.finished_at)}`);
+    const times = [t("job.elapsed", { t: fmtDuration(job.elapsed) })];
+    if (job.eta != null) times.push(t("job.left", { t: fmtDuration(job.eta) }));
+    if (job.state !== "running" && job.finished_at) times.push(t("job.ended", { t: fmtClock(job.finished_at) }));
     $("job-times").textContent = times.join(" · ");
 
     $("job-percent").textContent = `${job.percent.toFixed(job.percent < 100 ? 1 : 0)}%`;
@@ -456,26 +445,27 @@
     $("job-bar-wrap").setAttribute("aria-valuenow", String(Math.round(job.percent)));
 
     $("stages").replaceChildren(...job.stages.map((s) => {
+      // A stage's detail is a server message and stays in English.
       let detail = s.detail || "";
       if (s.state === "running" && s.total && !detail) detail = `${fmtNum(s.done)} / ${fmtNum(s.total)}`;
-      if (s.state === "pending") detail = "waiting";
+      if (s.state === "pending") detail = t("job.waiting");
       return el("li", { class: s.state, title: detail },
         el("span", { class: "icon" }),
         el("div", { class: "body" },
-          el("div", { class: "label" }, s.label),
+          el("div", { class: "label" }, stageLabel(s)),
           el("div", { class: "detail" }, detail)));
     }));
 
     $("counters").replaceChildren(...COUNTERS
-      .filter(([key]) => job.counters[key] != null)
-      .map(([key, label]) => el("div", {}, el("dt", {}, label), el("dd", {}, fmtNum(job.counters[key])))));
+      .filter((key) => job.counters[key] != null)
+      .map((key) => el("div", {}, el("dt", {}, t(`count.${key}`)), el("dd", {}, fmtNum(job.counters[key])))));
 
     appendLogs(job.logs, job.log_seq);
     renderBanner(job);
 
     document.title = job.state === "running"
-      ? `${Math.floor(job.percent)}% · Embedding service`
-      : "Embedding service · Scopus AI";
+      ? t("app.titleRunning", { p: Math.floor(job.percent) })
+      : t("app.title");
 
     if (job.state !== "running" && (previous === "running" || state.watchJob === job.id)) {
       state.watchJob = null;
@@ -484,18 +474,19 @@
   }
 
   function appendLogs(entries, lastSeq) {
-    if (!entries.length) return;
     const pre = $("log");
-    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
-    for (const e of entries) {
-      if (e.seq <= state.logSeq) continue;
-      const time = new Date(e.t * 1000).toLocaleTimeString();
-      pre.append(el("span", { class: e.level }, `${time}  ${e.msg}\n`));
+    if (entries.length) {
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+      for (const e of entries) {
+        if (e.seq <= state.logSeq) continue;
+        const time = new Date(e.t * 1000).toLocaleTimeString(I18N.locale());
+        pre.append(el("span", { class: e.level }, `${time}  ${e.msg}\n`));
+      }
+      while (pre.childNodes.length > 1500) pre.removeChild(pre.firstChild);
+      state.logSeq = Math.max(state.logSeq, lastSeq);
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
     }
-    while (pre.childNodes.length > 1500) pre.removeChild(pre.firstChild);
-    state.logSeq = Math.max(state.logSeq, lastSeq);
-    $("log-count").textContent = `(${pre.childNodes.length} lines)`;
-    if (atBottom) pre.scrollTop = pre.scrollHeight;
+    if (pre.childNodes.length) $("log-count").textContent = t("job.logLines", { n: pre.childNodes.length });
   }
 
   function renderBanner(job) {
@@ -506,21 +497,21 @@
     banner.replaceChildren();
     if (job.state === "completed" && job.summary) {
       const s = job.summary;
-      banner.append(
-        `✅ Embedding finished: ${fmtNum(s.papers_added)} papers added (${fmtNum(s.papers_total)} in the index, ` +
-        `${fmtNum(s.chunks_total)} chunks) in ${fmtDuration(s.seconds)}. Export the index (step 4) to use it in the search app.`);
+      banner.append(t("job.done", {
+        added: fmtNum(s.papers_added), total: fmtNum(s.papers_total), chunks: fmtNum(s.chunks_total), time: fmtDuration(s.seconds),
+      }));
     } else if (job.state === "failed") {
-      banner.append(`❌ Ingest failed: ${errorText(job)}. The index is unchanged.`);
+      banner.append(t("job.failed", { error: errorText(job) }));
     } else if (job.state === "cancelled") {
-      banner.append("Ingest was cancelled. The index is unchanged.");
+      banner.append(t("job.cancelled"));
     } else if (job.state === "interrupted") {
-      banner.append(`⚠️ ${errorText(job)}. The index is unchanged.`);
+      banner.append(t("job.interrupted", { error: errorText(job) }));
     }
     banner.hidden = false;
   }
 
   // Server messages end with a period; drop it so it can be followed by more text.
-  const errorText = (job) => (job.error || "unknown error").replace(/\.+$/, "");
+  const errorText = (job) => (job.error || t("common.unknownError")).replace(/\.+$/, "");
 
   function notifyFinished(job) {
     // Several open tabs, or a reload, must not alert twice for the same job.
@@ -532,13 +523,11 @@
     setTimeout(() => {
       if (job.state === "completed" && job.summary) {
         const s = job.summary;
-        alert(
-          "✅ Embedding finished!\n\n" +
-          `${fmtNum(s.papers_added)} papers added · ${fmtNum(s.papers_total)} papers / ${fmtNum(s.chunks_total)} chunks in the index\n` +
-          `Time: ${fmtDuration(s.seconds)}\n\n` +
-          "Export the index (step 4) to use it in the search app.");
+        alert(t("job.alertDone", {
+          added: fmtNum(s.papers_added), total: fmtNum(s.papers_total), chunks: fmtNum(s.chunks_total), time: fmtDuration(s.seconds),
+        }));
       } else if (job.state === "failed") {
-        alert(`❌ Ingest failed\n\n${errorText(job)}.\n\nThe index is unchanged.`);
+        alert(t("job.alertFailed", { error: errorText(job) }));
       }
     }, 150);
   }
@@ -557,26 +546,26 @@
 
     let reason = "";
     if (running) reason = "";
-    else if (state.jobState === "running") reason = "Export is possible when the ingest has finished.";
-    else if (!idx.exportable) reason = idx.collection ? "This index was built by an older version; initialize it again first."
-      : "There is no index to export yet.";
+    else if (state.jobState === "running") reason = t("export.whyIngest");
+    else if (!idx.exportable) reason = t(idx.collection ? "export.whyOld" : "export.whyNone");
     $("export-btn").disabled = running || !!reason;
-    $("export-btn").textContent = running ? "Exporting…" : "Export current index";
+    $("export-btn").textContent = t(running ? "export.running" : "export.button");
     $("export-hint").textContent = reason;
     $("export-hint").hidden = !reason;
 
     const pill = $("export-pill");
     pill.hidden = !ex.state || ex.state === "idle";
     pill.className = `pill ${ex.state}`;
-    pill.textContent = { running: "Running", completed: "Completed", failed: "Failed" }[ex.state] || "";
+    pill.textContent = ["running", "completed", "failed"].includes(ex.state) ? t(`state.${ex.state}`) : "";
 
     const banner = $("export-banner");
     banner.hidden = !ex.state || ex.state === "idle";
     banner.className = `banner ${ex.state}`;
     const elapsed = ex.started_at ? fmtDuration((ex.finished_at || Date.now() / 1000) - ex.started_at) : "";
+    // The export step is a server message and stays in English.
     if (running) banner.textContent = `${ex.step} (${elapsed})`;
-    else if (ex.state === "completed") banner.textContent = `✅ Bundle ${ex.bundle} written in ${elapsed}. Copy it to the search PC.`;
-    else if (ex.state === "failed") banner.textContent = `❌ Export failed: ${(ex.error || "unknown error").replace(/\.+$/, "")}.`;
+    else if (ex.state === "completed") banner.textContent = t("export.done", { bundle: ex.bundle, elapsed });
+    else if (ex.state === "failed") banner.textContent = t("export.failed", { error: (ex.error || t("common.unknownError")).replace(/\.+$/, "") });
 
     const bundles = ex.bundles || [];
     $("bundles").hidden = !bundles.length;
@@ -589,29 +578,28 @@
         el("td", { class: "num" }, fmtBytes(b.size)),
         el("td", { class: "muted" }, b.created_at || ""),
         el("td", { class: "action" },
-          el("button", { type: "button", class: "btn btn-small btn-danger", onclick: () => deleteBundle(b.name) }, "Delete")))));
+          el("button", { type: "button", class: "btn btn-small btn-danger", onclick: () => deleteBundle(b.name) }, t("common.delete"))))));
   }
 
   async function startExport() {
     const idx = state.status && state.status.index;
     const papers = idx && idx.meta ? fmtNum(idx.meta.papers) : "?";
-    if (!confirm(`Export the current index (${papers} papers) as a bundle for the search app?\n\n` +
-      "Ingests cannot start while the export runs.")) return;
+    if (!confirm(t("export.confirm", { papers }))) return;
     $("export-btn").disabled = true;
     try {
       await api("POST", "/api/exports");
     } catch (err) {
-      alert(`Could not start the export:\n\n${err.message}`);
+      alert(t("export.cannotStart", { error: err.message }));
     }
     poll();
   }
 
   async function deleteBundle(name) {
-    if (!confirm(`Delete the export bundle\n${name}?\n\nThe index itself is not affected.`)) return;
+    if (!confirm(t("export.confirmDelete", { name }))) return;
     try {
       await api("DELETE", `/api/exports/${encodeURIComponent(name)}`);
     } catch (err) {
-      alert(`Could not delete the bundle:\n\n${err.message}`);
+      alert(t("export.cannotDelete", { error: err.message }));
     }
     poll();
   }
@@ -625,7 +613,7 @@
   $("ingest-btn").addEventListener("click", startIngest);
   $("export-btn").addEventListener("click", startExport);
   $("cancel-btn").addEventListener("click", async () => {
-    if (!confirm("Cancel the running ingest? The current index stays unchanged.")) return;
+    if (!confirm(t("job.confirmCancel"))) return;
     $("cancel-btn").disabled = true;
     try { await api("POST", "/api/cancel"); } catch (err) { alert(err.message); }
     poll(true);
@@ -649,10 +637,8 @@
     $("auth-confirm-wrap").hidden = !signup;
     $("auth-confirm").required = signup;
     $("auth-password").autocomplete = signup ? "new-password" : "current-password";
-    $("auth-submit").textContent = signup ? "Create account" : "Sign in";
-    $("auth-hint").textContent = signup
-      ? "Username: 3–32 letters, digits, dots, dashes or underscores. Password: at least 8 characters."
-      : "Only administrator accounts can use the embedding service.";
+    $("auth-submit").textContent = t(signup ? "auth.createAccount" : "auth.signIn");
+    $("auth-hint").textContent = t(signup ? "auth.signupHint" : "auth.adminHint");
     $("auth-error").hidden = true;
   }
 
@@ -671,7 +657,7 @@
     e.preventDefault();
     const signup = authMode === "signup";
     const showError = (text) => { $("auth-error").textContent = text; $("auth-error").hidden = false; };
-    if (signup && $("auth-password").value !== $("auth-confirm").value) return showError("The passwords do not match.");
+    if (signup && $("auth-password").value !== $("auth-confirm").value) return showError(t("auth.passwordsDiffer"));
     $("auth-submit").disabled = true;
     try {
       await api("POST", signup ? "/api/auth/signup" : "/api/auth/login", {
@@ -699,13 +685,14 @@
     try {
       st = await api("GET", "/api/auth/state");
     } catch (err) {
-      document.body.textContent = `Embedding service unreachable: ${err.message}`;
+      document.body.textContent = t("app.unreachable", { error: err.message });
       return;
     }
     if (!st.user) return showAuth(st);
     if (st.user.role !== "admin") {
       clearTimeout(pollTimer);
       started = false;
+      state.deniedUser = st.user.username;
       $("denied-user").textContent = st.user.username;
       return showScreen("denied");
     }
@@ -719,6 +706,23 @@
     openFolder(linked !== null ? linked : storageGet("embedding.path") || "");
     poll();
   }
+
+  // Language switched: rebuild what this script wrote (the HTML texts are done by i18n.js).
+  I18N.onChange(() => {
+    // Rebuilt from the text, which lost the names filled in here.
+    $("denied-user").textContent = state.deniedUser;
+    if (state.status) $("export-dir").textContent = state.status.config.export_dir;
+    if (!$("auth").hidden) setAuthMode(authMode);
+    if (state.folder) {
+      // Keep the tables the user ticked or unticked.
+      const before = selection();
+      renderFolder();
+      document.querySelectorAll(".table-check:not(:disabled)").forEach((c) => { c.checked = before.tables.includes(c.value); });
+      if ($("ris-check")) $("ris-check").checked = before.includeRis;
+      updateIngestButton();
+    }
+    if (state.status) render(state.status);
+  });
 
   $("auth-form").addEventListener("submit", submitAuth);
   $("tab-login").addEventListener("click", () => setAuthMode("login"));

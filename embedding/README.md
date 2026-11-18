@@ -103,6 +103,13 @@ docker compose up -d
 
 An ingest and an export never run at the same time.
 
+**Language**: *中文* / *English* in the top bar (and on the sign-in card) switches the page texts
+between English and Simplified Chinese; each browser remembers its choice. The texts are in
+`app/embedding_service/static/i18n/en.js` and `zh.js`, the switch in `static/i18n.js`, and Chinese
+is drawn with the bundled Noto Sans SC font (`static/fonts/`, SIL Open Font License). Messages from
+the server (log lines, stage details, warnings, errors) stay in English. Files under `static/` are
+read on every request: after changing them, reload the page (Ctrl+F5); no rebuild or restart.
+
 ## Export bundle
 
 ```

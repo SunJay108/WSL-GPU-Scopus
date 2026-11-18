@@ -3,7 +3,9 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const { ICONS, el, icon, api, request, renderMarkdown, md, copyText, logout } = window.UI;
+  const { t } = window.I18N;
 
+  // Example questions, like the questions and answers themselves, are not translated.
   const EXAMPLES = [
     "What are recent methods for fault detection in electric motor drives?",
     "How is deep learning used for medical image segmentation?",
@@ -29,11 +31,11 @@
   function groupLabel(ts) {
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000;
-    if (ts >= today) return "Today";
-    if (ts >= today - 86400) return "Yesterday";
-    if (ts >= today - 7 * 86400) return "Previous 7 days";
-    if (ts >= today - 30 * 86400) return "Previous 30 days";
-    return new Date(ts * 1000).toLocaleDateString(undefined, { year: "numeric", month: "long" });
+    if (ts >= today) return t("side.today");
+    if (ts >= today - 86400) return t("side.yesterday");
+    if (ts >= today - 7 * 86400) return t("side.last7");
+    if (ts >= today - 30 * 86400) return t("side.last30");
+    return new Date(ts * 1000).toLocaleDateString(I18N.locale(), { year: "numeric", month: "long" });
   }
 
   // ------------------------------------------------------------ sign in / sign up
@@ -59,10 +61,10 @@
     $("auth-confirm-wrap").hidden = !signup;
     $("auth-confirm").required = signup;
     $("auth-password").autocomplete = signup ? "new-password" : "current-password";
-    $("auth-submit").textContent = signup ? "Create account" : "Sign in";
+    $("auth-submit").textContent = t(signup ? "auth.createAccount" : "auth.signIn");
     $("auth-hint").textContent = signup
-      ? "Username: 3–32 letters, digits, dots, dashes or underscores. Password: at least 8 characters."
-      : (state.authState.allow_signup ? "" : "Ask an administrator if you need an account.");
+      ? t("auth.signupHint")
+      : (state.authState.allow_signup ? "" : t("auth.askAdmin"));
     $("auth-error").hidden = true;
   }
 
@@ -72,7 +74,7 @@
     const username = $("auth-username").value.trim();
     const password = $("auth-password").value;
     const showError = (text) => { $("auth-error").textContent = text; $("auth-error").hidden = false; };
-    if (signup && password !== $("auth-confirm").value) return showError("The passwords do not match.");
+    if (signup && password !== $("auth-confirm").value) return showError(t("common.passwordsDiffer"));
 
     $("auth-submit").disabled = true;
     try {
@@ -96,6 +98,7 @@
     const admin = user.role === "admin";
     $("user-role").hidden = !admin;
     $("admin-link").hidden = !admin;
+    renderIndexInfo();
     loadStatus();
     clearInterval(state.statusTimer);
     state.statusTimer = setInterval(loadStatus, 30000);
@@ -119,7 +122,7 @@
     const list = $("conv-list");
     list.replaceChildren();
     if (!state.conversations.length) {
-      list.append(el("div", { class: "conv-empty" }, $("search").value.trim() ? "No matching chats." : "No chats yet."));
+      list.append(el("div", { class: "conv-empty" }, t($("search").value.trim() ? "side.noMatches" : "side.noChats")));
       return;
     }
     let lastGroup = null;
@@ -136,8 +139,8 @@
       },
         el("span", { class: "conv-title" }, conv.title),
         el("span", { class: "conv-actions" },
-          el("button", { type: "button", title: "Rename", "aria-label": "Rename", onclick: (e) => { e.preventDefault(); e.stopPropagation(); startRename(item, conv); } }, icon("edit")),
-          el("button", { type: "button", title: "Delete", "aria-label": "Delete", onclick: (e) => { e.preventDefault(); e.stopPropagation(); deleteConversation(conv); } }, icon("trash"))));
+          el("button", { type: "button", title: t("side.rename"), "aria-label": t("side.rename"), onclick: (e) => { e.preventDefault(); e.stopPropagation(); startRename(item, conv); } }, icon("edit")),
+          el("button", { type: "button", title: t("side.delete"), "aria-label": t("side.delete"), onclick: (e) => { e.preventDefault(); e.stopPropagation(); deleteConversation(conv); } }, icon("trash"))));
       item.addEventListener("click", () => closeSidebar());
       list.append(item);
     }
@@ -171,7 +174,7 @@
   }
 
   async function deleteConversation(conv) {
-    if (!confirm(`Delete the chat "${conv.title}"?`)) return;
+    if (!confirm(t("side.confirmDelete", { title: conv.title }))) return;
     try {
       await api("DELETE", `/api/conversations/${conv.id}`);
     } catch (err) {
@@ -236,7 +239,7 @@
     const box = $("messages");
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     box.replaceChildren();
-    $("chat-title").textContent = conv ? conv.title : "New chat";
+    $("chat-title").textContent = conv ? conv.title : t("chat.new");
     $("export-btn").hidden = !(conv && conv.messages.length);
 
     if (!conv || (!conv.messages.length && !conv.pending)) {
@@ -254,10 +257,11 @@
 
   function renderWelcome() {
     const info = state.status && state.status.index;
-    let sub = "Answers are grounded in the papers of the local index, with citations.";
-    if (info && info.papers) sub = `Ask about anything covered by the ${Number(info.papers).toLocaleString()} indexed papers. Answers come with citations.`;
+    const sub = info && info.papers
+      ? t("chat.welcomeSubPapers", { n: Number(info.papers) })
+      : t("chat.welcomeSub");
     return el("div", { class: "welcome" },
-      el("h2", {}, "What would you like to research?"),
+      el("h2", {}, t("chat.welcome")),
       el("p", {}, sub),
       el("div", { class: "examples" },
         EXAMPLES.map((q) => el("button", { class: "example", type: "button", onclick: () => ask(q) }, q))));
@@ -441,7 +445,7 @@
   function updateComposer() {
     const busy = state.sending || !!(state.conversation && state.conversation.pending);
     $("send").disabled = busy || !$("input").value.trim();
-    $("input").placeholder = busy ? "Waiting for the answer…" : "Ask a research question…";
+    $("input").placeholder = t(busy ? "chat.waiting" : "chat.placeholder");
     document.querySelectorAll(".followup").forEach((b) => { b.disabled = busy; });
   }
 
@@ -457,19 +461,24 @@
   async function loadStatus() {
     try {
       state.status = await api("GET", "/api/status");
+      state.statusFailed = false;
     } catch (_) {
-      $("index-info").textContent = "Search service unreachable";
+      state.statusFailed = true;
+      renderIndexInfo();
       return;
     }
-    const info = state.status.index || {};
-    if (info.papers) {
-      $("index-info").textContent = `${Number(info.papers).toLocaleString()} papers · built ${String(info.built_at || "").slice(0, 10)}`;
-    } else if (info.ready) {
-      $("index-info").textContent = "Index ready";
-    } else {
-      $("index-info").textContent = "No index yet";
-    }
+    renderIndexInfo();
     if (!state.conversation) renderThread();
+  }
+
+  function renderIndexInfo() {
+    const info = (state.status && state.status.index) || {};
+    let text;
+    if (state.statusFailed) text = t("side.unreachable");
+    else if (!state.status) text = t("side.loadingIndex");
+    else if (info.papers) text = t("side.indexPapers", { n: Number(info.papers), date: String(info.built_at || "").slice(0, 10) });
+    else text = t(info.ready ? "side.indexReady" : "side.noIndex");
+    $("index-info").textContent = text;
   }
 
   function openPasswordDialog() {
@@ -481,14 +490,14 @@
   async function savePassword(e) {
     e.preventDefault();
     const showError = (text) => { $("pw-error").textContent = text; $("pw-error").hidden = false; };
-    if ($("pw-new").value !== $("pw-repeat").value) return showError("The new passwords do not match.");
+    if ($("pw-new").value !== $("pw-repeat").value) return showError(t("pw.differ"));
     try {
       await api("POST", "/api/auth/password", { current: $("pw-current").value, new: $("pw-new").value });
     } catch (err) {
       return showError(err.message);
     }
     $("password-dialog").close();
-    alert("Password changed.");
+    alert(t("pw.changed"));
   }
 
   // ------------------------------------------------------------ wiring
@@ -515,7 +524,7 @@
     state.searchTimer = setTimeout(loadConversations, 250);
   });
   $("clear-all").addEventListener("click", async () => {
-    if (!confirm("Delete all your chats? You will no longer see them.")) return;
+    if (!confirm(t("side.confirmDeleteAll"))) return;
     try { await api("DELETE", "/api/conversations"); } catch (err) { alert(err.message); return; }
     location.hash = "";
     loadConversations();
@@ -542,12 +551,22 @@
   });
   window.addEventListener("hashchange", showRoute);
 
+  // Language switched: rebuild the texts made here (the open chat itself stays as it is).
+  I18N.onChange(() => {
+    if (!$("auth").hidden) setAuthMode(state.authMode);
+    if (!state.user) return;
+    renderIndexInfo();
+    renderConversations();
+    const conv = state.conversation;
+    if (!conv || (!conv.messages.length && !conv.pending)) renderThread(); else updateComposer();
+  });
+
   (async () => {
     let authState;
     try {
       authState = await api("GET", "/api/auth/state");
     } catch (err) {
-      document.body.textContent = `Search service unreachable: ${err.message}`;
+      document.body.textContent = t("auth.unreachable", { error: err.message });
       return;
     }
     if (authState.user) startApp(authState.user); else showAuth(authState);
