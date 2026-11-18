@@ -64,9 +64,11 @@ The admin panel is http://localhost:7860/admin.
    cp -r /mnt/e/papers_20261020_101500_20261020_110000 ~/Scopus/bundles/
    ```
 
-3. http://localhost:7860/admin › **Index** › **Import** (or
+3. http://localhost:7860/admin › **Index** › **Replace** (or
    `docker exec -it scopus-ai-gpu python import_index.py <bundle>`). Searches keep using the current
    index until the new one is loaded and checked; then the bundle folder can be deleted there.
+   For a bundle with only new papers use **Add** (`... import_index.py <bundle> --add`): its papers are
+   added to the current index instead of replacing it.
 
 Details: `~/Scopus/README.md` (section 6) and `~/Scopus/Deploy-GPU-Project-Offline.md`.
 

@@ -117,6 +117,7 @@ class UserUpdate(BaseModel):
 class ImportBody(BaseModel):
     bundle: str
     low_memory: bool = False
+    add: bool = False          # add the bundle's papers to the current index instead of replacing it
 
 
 def _sse(event, data):
@@ -417,13 +418,17 @@ def admin_import(body: ImportBody, request: Request, admin: dict = Depends(admin
         raise HTTPException(400, str(exc))
     if problems:
         raise HTTPException(400, "The bundle cannot be imported: " + "; ".join(problems) + ".")
-    if not body.low_memory and manifest.get("index_version") == (read_index_meta() or {}).get("version"):
+    meta = read_index_meta() or {}
+    low_memory = body.low_memory and not body.add
+    if body.add and manifest.get("index_version") in index_import.index_versions(meta):
+        raise HTTPException(409, "This bundle is already in the index.")
+    if not body.add and not low_memory and manifest.get("index_version") == meta.get("version"):
         raise HTTPException(409, "This index is already in use.")
     try:
-        imports.start(body.bundle, admin, body.low_memory)
+        imports.start(body.bundle, admin, low_memory, body.add)
     except index_import.ImportBusyError as exc:
         raise HTTPException(409, str(exc))
-    audit.log("index_import_start", admin, detail={"bundle": body.bundle, "low_memory": body.low_memory,
+    audit.log("index_import_start", admin, detail={"bundle": body.bundle, "low_memory": low_memory, "add": body.add,
                                                    "papers": manifest.get("papers")}, ip=_ip(request))
     return {"ok": True}
 

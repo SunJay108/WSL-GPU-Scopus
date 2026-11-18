@@ -113,13 +113,15 @@
         <h3 class="tab-title">Import a bundle</h3>
         <p class="muted">Bundles are made by the embedding app (<em>Export for the search app</em>). Copy the whole
           bundle folder into <code id="bundles-dir"></code> on this PC; it then appears below.
-          Searches keep using the current index until the new one is loaded and checked.</p>
+          <strong>Replace</strong> makes the bundle the whole index; searches keep using the current index until
+          the new one is loaded and checked. <strong>Add</strong> adds the bundle's papers to the current index
+          (a paper already in it is replaced by the bundle's copy) – for bundles with only new papers.</p>
         <div class="banner" id="import-banner" role="status" hidden>
           <div id="import-text"></div>
           <div class="bar" id="import-bar-wrap" hidden><div class="bar-fill" id="import-bar"></div></div>
         </div>
         <label class="check"><input type="checkbox" id="low-memory">
-          Remove the current index first (needs half the memory; no search during the import)</label>
+          Replace: remove the current index first (needs half the memory; no search during the import)</label>
         <div class="table-wrap">
           <table class="table">
             <thead><tr><th>Bundle</th><th class="num">Papers</th><th class="num">Chunks</th><th class="num">Size</th><th>Created</th><th>Status</th><th></th></tr></thead>

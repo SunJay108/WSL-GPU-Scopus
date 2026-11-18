@@ -205,12 +205,16 @@ The services then keep running without a WSL window, until `wsl --shutdown` or a
    ```
 
 2. Admin panel › **Index**: the bundle is listed as *ready* (or *cannot be imported*, with the reason).
-3. **Import**. Progress: file check (SHA-256) → Qdrant loads the snapshot → checks → switch. Searches use
-   the current index until the switch; a damaged bundle or a failed import changes nothing. With
-   *Remove the current index first* it needs half the memory, but search is off during the import.
+3. **Replace** for a bundle of the whole index. Progress: file check (SHA-256) → Qdrant loads the
+   snapshot → checks → switch. Searches use the current index until the switch; a damaged bundle or a
+   failed import changes nothing. With *Remove the current index first* it needs half the memory, but
+   search is off during the import.
+   **Add** puts the bundle's papers into the current index (a paper already in it is replaced, not
+   duplicated). Only the smaller side is copied – the bundle into the index, or the index into a larger
+   bundle, which then becomes the index – at about 20 s per 1,000 chunks on a hard disk.
 4. Afterwards **Delete** the bundle folder.
 
-Command line: `docker exec -it scopus-ai-gpu python import_index.py [<bundle>] [--verify] [--low-memory]`.
+Command line: `docker exec -it scopus-ai-gpu python import_index.py [<bundle>] [--verify] [--low-memory | --add]`.
 Measured: 5.5 GB bundle (1,082,282 papers) in 7.8 minutes on a hard disk.
 
 ## 4.5 Settings
@@ -304,8 +308,10 @@ it), and WSL stops when no WSL window is open:
    **Start ingest**. **Initialize index** starts over with only the selected folder.
 3. Check the quality line of the index card (both numbers close to 100 of 100).
 4. **Export for the search app** → `~/ScopusEmbedding/data/exports/<bundle>`; copy the whole folder to
-   the USB drive (`cp -r ~/ScopusEmbedding/data/exports/papers_… /mnt/e/`). The search PC's import replaces
-   its whole index, so export the complete index each time.
+   the USB drive (`cp -r ~/ScopusEmbedding/data/exports/papers_… /mnt/e/`). On the search PC, **Replace**
+   makes the bundle its whole index and **Add** adds the bundle's papers to its index (4.4). For an add,
+   ingest only the new data with **Initialize index** and export; this replaces the embedding PC's own
+   index with the new papers, so keep the earlier bundles.
 
 Speed on an RTX 2060: 250–320 chunks/s (about 1.1 chunks per paper) – 128,000 papers in 8 minutes,
 950,000 papers in 80 minutes; a faster GPU is faster in proportion.
