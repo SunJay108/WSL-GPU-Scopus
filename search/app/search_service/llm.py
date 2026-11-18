@@ -81,6 +81,33 @@ def chat(messages, max_tokens=64, temperature=0.0, grammar=None, stop=None, on_t
     return text.strip(), finish
 
 
+_context_size = None
+
+
+def context_size():
+    """
+    Tokens of context per answer (one server slot; LLM_CTX in .env), or None
+    if unknown.  Asked every time: the llm service can be restarted with
+    another LLM_CTX while this app keeps running.
+    """
+    global _context_size
+    try:
+        with urllib.request.urlopen(LLM_URL.rstrip("/") + "/props", timeout=5) as resp:
+            _context_size = int(json.load(resp)["default_generation_settings"]["n_ctx"]) or _context_size
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
+        pass
+    return _context_size
+
+
+def count_tokens(text):
+    """Tokens of `text` for this model, or None if the server cannot say."""
+    try:
+        with _post("/tokenize", {"content": text}, 10) as resp:
+            return len(json.load(resp)["tokens"])
+    except (LLMUnavailable, ValueError, KeyError):
+        return None
+
+
 def healthy() -> bool:
     try:
         with urllib.request.urlopen(LLM_URL.rstrip("/") + "/health", timeout=5) as resp:

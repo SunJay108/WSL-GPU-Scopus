@@ -440,14 +440,83 @@ ANSWER_SYSTEM = (
     "NO_ANSWER\n"
     "- If they answer only part of the question, answer that part and say that the sources do "
     "not cover the rest.\n"
-    "- Cover the relevant findings of every source that addresses the question, in two to four "
-    "paragraphs (or a list), in the language of the question. Do not repeat yourself."
+    f"- {ANSWER_INSTRUCTION}, in the language of the question. Do not repeat yourself."
 )
 
 SUMMARY_SYSTEM = (
-    "You summarize an answer of a literature search engine in two to four sentences. Use only "
+    f"You summarize an answer of a literature search engine in {SUMMARY_SENTENCES} sentences. Use only "
     "statements from the answer, keep their source numbers like [2], and add nothing new."
 )
+
+# Room for the chat template around the messages, and the shortest answer
+# worth asking for before the weakest paper is left out instead.
+_TEMPLATE_TOKENS = 64
+_MIN_ANSWER_TOKENS = 400
+
+
+def _fit_context(question, sources):
+    """
+    The sources and answer length that fit one answer's context (LLM_CTX):
+    the answer is shortened to the room left by the prompt, and when that is
+    less than _MIN_ANSWER_TOKENS the weakest papers are left out.  Returns
+    (sources, max_tokens).
+    """
+    context = llm.context_size()
+    papers = sorted({s.n for s in sources})                 # numbered by relevance
+    while True:
+        messages = _answer_messages(question, sources)
+        used = llm.count_tokens("\n\n".join(m["content"] for m in messages)) if context else None
+        if used is None:
+            return sources, LLM_ANSWER_TOKENS
+        room = context - used - _TEMPLATE_TOKENS
+        if room >= min(LLM_ANSWER_TOKENS, _MIN_ANSWER_TOKENS) or len(papers) == 1:
+            max_tokens = max(64, min(LLM_ANSWER_TOKENS, room))
+            print(f"Answer context: {len(papers)} papers, prompt {used} tokens, "
+                  f"answer up to {max_tokens} tokens (context {context})")
+            return sources, max_tokens
+        weakest = papers.pop()
+        sources = [s for s in sources if s.n != weakest]
+
+
+# Citations in the answer: "[2]", "[1, 3]", "[2-4]" (not a Markdown link "[2](...)").
+_CITATION_GROUP = re.compile(r"\[(\d+(?:\s*[,;–-]\s*\d+)*)\](?!\()")
+
+
+def _citation_numbers(group):
+    numbers = []
+    for part in re.split(r"\s*[,;]\s*", group.strip()):
+        m = re.fullmatch(r"(\d+)\s*[–-]\s*(\d+)", part)
+        if m and int(m[1]) <= int(m[2]) <= int(m[1]) + 20:
+            numbers.extend(range(int(m[1]), int(m[2]) + 1))
+        else:
+            numbers.extend(int(n) for n in re.findall(r"\d+", part))
+    return numbers
+
+
+def _cited_order(known, *texts):
+    """Source numbers in the order the texts first cite them (only numbers in `known`)."""
+    order = []
+    for text in texts:
+        for group in _CITATION_GROUP.findall(text or ""):
+            numbers = _citation_numbers(group)
+            if set(numbers) <= known:
+                order.extend(n for n in numbers if n not in order)
+    return order
+
+
+def _renumber(text, mapping):
+    """Citations renumbered by `mapping` (old -> new); brackets that are not citations stay."""
+    def replace(m):
+        numbers = _citation_numbers(m.group(1))
+        if not set(numbers) <= set(mapping):
+            return m.group(0)
+        return "[" + ", ".join(str(mapping[n]) for n in dict.fromkeys(numbers)) + "]"
+    return _CITATION_GROUP.sub(replace, text or "")
+
+
+def _in_citation_order(text, known):
+    """`text` with its citations numbered 1, 2, ... in the order they first appear."""
+    return _renumber(text, {old: new for new, old in enumerate(_cited_order(known, text), 1)})
 
 
 def _answer_messages(question, sources):
@@ -579,9 +648,12 @@ def _answer(question, history, emit):
     if top_score < RELEVANCE_WARN_SCORE:
         base["notice"] = LOW_RELEVANCE_NOTE
 
-    # The same papers are given to the model, checked against and listed.
+    # The same papers are given to the model and checked against; the ones
+    # the answer cites are listed under it, numbered in the order they are cited.
     nodes = ([n for n in nodes if float(n.score or 0) >= SOURCE_MIN_SCORE] or nodes[:1])[:ANSWER_SOURCES]
     references, sources = build_sources(nodes)
+    sources, answer_tokens = _fit_context(standalone, sources)
+    known = {s.n for s in sources}
     verifier = grounding.AnswerVerifier(sources, score_pairs, standalone)
 
     stage("answer", "Writing the answer…")
@@ -602,11 +674,11 @@ def _answer(question, history, emit):
         now = time.time()
         if now - last_emit[0] >= 0.15:
             last_emit[0] = now
-            emit("delta", text=text)
+            emit("delta", text=_in_citation_order(text, known))
 
     raw, finish, verdict = "", None, None
     try:
-        raw, finish = llm.chat(_answer_messages(standalone, sources), max_tokens=LLM_ANSWER_TOKENS,
+        raw, finish = llm.chat(_answer_messages(standalone, sources), max_tokens=answer_tokens,
                                temperature=LLM_TEMPERATURE, on_text=on_text)
         verdict = monitor.finish(raw) if monitor else None
     except _NoAnswer:
@@ -627,10 +699,22 @@ def _answer(question, history, emit):
         print(f"Grounding: dropped ({reason}): {sentence[:160]!r}")
     if not answer or (GROUNDING and not verifier.supported_claims()):
         return _final({**base, "status": "no_results", "message": NOT_IN_PAPERS_MESSAGE})
-    emit("delta", text=answer)
+    emit("delta", text=_in_citation_order(answer, known))
 
     stage("summary", "Summarizing…")
     summary = generate_summary(answer, verifier)
+
+    # References: only the cited papers, numbered 1, 2, ... in the order the
+    # answer (then the summary) first cites them.  Without any citation (no
+    # grounding and a model that did not cite) all papers stay listed.
+    order = _cited_order(known, answer, summary)
+    if order:
+        mapping = {old: new for new, old in enumerate(order, 1)}
+        answer, summary = _renumber(answer, mapping), _renumber(summary, mapping)
+        references = sorted(({**r, "n": mapping[r["n"]]} for r in references if r["n"] in mapping),
+                            key=lambda r: r["n"])
+    else:
+        references = [r for r in references if r["n"] in known]
 
     followups = []
     if SUGGEST_FOLLOWUPS:
